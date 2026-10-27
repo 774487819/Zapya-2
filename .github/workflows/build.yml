@@ -27,7 +27,7 @@ jobs:
         run: |
           flutter create -a kotlin --org com.autosaver --project-name my_saver_app app_build
           cd app_build
-          flutter pub add dio shared_preferences path_provider video_player youtube_explode_dart flutter_local_notifications
+          flutter pub add dio shared_preferences path_provider video_player youtube_explode_dart flutter_local_notifications:^19.4.2
 
       - name: Enable core library desugaring
         run: |
@@ -1614,8 +1614,10 @@ jobs:
               if (options.isEmpty) throw Exception('لا توجد صيغ متاحة لهذا الفيديو');
 
               MuxedStreamInfo stream = options.first;
-              // الشورتس مباشرة، والفيديوهات الطويلة بعد اختيار الدقة والتأكيد
-              if (!url.contains('/shorts/')) {
+              // الشورتس (رابط /shorts/ أو مدة 60 ثانية فأقل) مباشرة، والفيديوهات الطويلة بعد اختيار الدقة والتأكيد
+              final isShort = url.contains('/shorts/') ||
+                  (video.duration != null && video.duration!.inSeconds <= 60);
+              if (!isShort) {
                 final chosen =
                     await _chooseYoutubeQuality(video.title, video.duration, options);
                 if (chosen == null) throw Exception('تم إلغاء التنزيل');
