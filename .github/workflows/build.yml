@@ -145,6 +145,7 @@ jobs:
           import android.content.ContentValues
           import android.content.Context
           import android.content.Intent
+          import android.content.res.Configuration
           import android.graphics.Path
           import android.graphics.Rect
           import android.hardware.Sensor
@@ -674,14 +675,37 @@ jobs:
                   busy = true
                   vibrateShort(120)
 
-                  val shareWords = listOf("مشاركة", "إرسال", "Share", "Send", "share")
-                  val clickedShare = findAndClickNode(root, shareWords)
-
-                  if (!clickedShare) {
-                      tapCoordinates(0.91f, 0.72f)
+                  val pkg = root.packageName?.toString() ?: ""
+                  if (pkg == "com.google.android.youtube" && isLandscape()) {
+                      // يوتيوب بوضع ملء الشاشة لا يعرض زر المشاركة: نخرج منه أولاً ثم نكمل
+                      performGlobalAction(GLOBAL_ACTION_BACK)
+                      handler.postDelayed({ shareThenCopy(0, 5) }, 1200)
+                  } else {
+                      shareThenCopy(0, 1)
                   }
+              }
 
-                  waitAndClickCopy(0)
+              private fun isLandscape(): Boolean =
+                  resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+
+              // نضغط زر المشاركة (مع إعادة المحاولة بعد الخروج من ملء الشاشة) ثم ننتقل لنسخ الرابط
+              private fun shareThenCopy(attempt: Int, maxAttempts: Int) {
+                  val shareWords = listOf("مشاركة", "إرسال", "Share", "Send", "share")
+                  val r = rootInActiveWindow
+                  val clicked = r != null && findAndClickNode(r, shareWords)
+                  when {
+                      clicked -> waitAndClickCopy(0)
+                      attempt + 1 < maxAttempts ->
+                          handler.postDelayed({ shareThenCopy(attempt + 1, maxAttempts) }, 600)
+                      !isLandscape() -> {
+                          tapCoordinates(0.91f, 0.72f)
+                          waitAndClickCopy(0)
+                      }
+                      else -> {
+                          vibrateFail()
+                          busy = false
+                      }
+                  }
               }
 
               // قائمة المشاركة قد تتأخر: نحاول عدة مرات، ولا نفتح التطبيق إلا إذا نجح نسخ الرابط فعلاً
@@ -1009,6 +1033,13 @@ jobs:
                 : options.map((o) => o.height).reduce((a, b) => a > b ? a : b);
           }
 
+          // يجمع نتائج كل محركات يوتيوب: الأولى للعرض، والباقي احتياط إن فشل التنزيل
+          class _YtResolver {
+            final List<_YtInfo> infos = [];
+            final Completer<_YtInfo?> first = Completer<_YtInfo?>();
+            final Completer<void> all = Completer<void>();
+          }
+
           // ================= تصميم الواجهة الجديد: ألوان ومكوّنات مساعدة =================
           const Color kBg = Color(0xFF070B14);
           const Color kSurface = Color(0xFF111827);
@@ -1141,6 +1172,7 @@ jobs:
             bool _notifActive = false;
             int _lastNotifPct = -1;
             String _notifTitle = '';
+            final List<String> _ytLog = [];
 
             // إيقاف التنزيل (من الزر داخل التطبيق أو من زر الإشعار)
             void _requestCancel() {
@@ -1927,44 +1959,148 @@ jobs:
               return _YtInfo(title, secs, opts, vr ? 'ANDROID_VR' : 'IOS');
             }
 
-            // تشغيل كل المحركات معاً: أول نتيجة تصل تنتظر 1.5 ثانية للباقي ثم نختار الأعلى دقة
-            Future<_YtInfo?> _resolveYoutube(String id) {
-              final c = Completer<_YtInfo?>();
-              final got = <_YtInfo>[];
-              int pending = 3;
+            // المحرك 4: خوادم Piped (تعطي روابط جاهزة لجوجل فيديو) - قد تتوقف بعض النسخ فنجرّب أكثر من واحدة
+            Future<_YtInfo?> _ytViaPiped(String id) async {
+              const bases = [
+                'https://pipedapi.kavin.rocks',
+                'https://pipedapi.adminforge.de',
+                'https://api.piped.private.coffee',
+              ];
+              for (final base in bases) {
+                try {
+                  final r = await _dio
+                      .get('$base/streams/$id',
+                          options: Options(receiveTimeout: const Duration(seconds: 8)))
+                      .timeout(const Duration(seconds: 10));
+                  final d = r.data is String ? jsonDecode(r.data) : r.data;
+                  if (d is! Map) continue;
+
+                  Map? bestAudio;
+                  int bestBr = -1;
+                  for (final e in ((d['audioStreams'] as List?) ?? const [])) {
+                    if (e is! Map || e['url'] == null) continue;
+                    if (!'${e['mimeType']}'.startsWith('audio/mp4')) continue;
+                    if ((int.tryParse('${e['contentLength']}') ?? 0) <= 0) continue;
+                    final br = ((e['bitrate'] ?? 0) as num).toInt();
+                    if (br > bestBr) {
+                      bestBr = br;
+                      bestAudio = e;
+                    }
+                  }
+                  final audio = bestAudio;
+                  if (audio == null) continue;
+
+                  final vids = <Map>[];
+                  for (final e in ((d['videoStreams'] as List?) ?? const [])) {
+                    if (e is! Map || e['url'] == null) continue;
+                    if (e['videoOnly'] != true) continue;
+                    if (!'${e['mimeType']}'.startsWith('video/mp4')) continue;
+                    if (!'${e['codec']}'.startsWith('avc1')) continue;
+                    if ((int.tryParse('${e['contentLength']}') ?? 0) <= 0) continue;
+                    vids.add(e);
+                  }
+                  if (vids.isEmpty) continue;
+                  vids.sort((a, b) => ((b['height'] ?? 0) as num)
+                      .toInt()
+                      .compareTo(((a['height'] ?? 0) as num).toInt()));
+
+                  final opts = <_YtOption>[];
+                  final seen = <String>{};
+                  for (final v in vids) {
+                    final h = ((v['height'] ?? 0) as num).toInt();
+                    final label = '${v['quality'] ?? '${h}p'}';
+                    if (!seen.add(label)) continue;
+                    opts.add(_YtOption(
+                      label,
+                      height: h,
+                      videoUrl: Uri.parse('${v['url']}'),
+                      videoBytes: int.parse('${v['contentLength']}'),
+                      audioUrl: Uri.parse('${audio['url']}'),
+                      audioBytes: int.parse('${audio['contentLength']}'),
+                    ));
+                  }
+                  return _YtInfo(d['title']?.toString(),
+                      int.tryParse('${d['duration']}') ?? 0, opts, 'Piped');
+                } catch (_) {}
+              }
+              return null;
+            }
+
+            // نص قصير لسبب الفشل (يظهر للمستخدم لتشخيص المشكلة)
+            String _short(Object e) {
+              String t;
+              if (e is DioException) {
+                t = '${e.type.name} ${e.response?.statusCode ?? ''}';
+              } else {
+                t = e.toString().replaceAll('Exception: ', '').split('\n').first;
+              }
+              return t.length > 80 ? t.substring(0, 80) : t;
+            }
+
+            // يختار من نتيجة محرك ما نفس الدقة التي اختارها المستخدم (أو أقرب دقة أقل منها)
+            _YtOption? _matchOption(_YtInfo inf, _YtOption want) {
+              for (final o in inf.options) {
+                if (o.label == want.label) return o;
+              }
+              _YtOption? best;
+              for (final o in inf.options) {
+                if (o.height <= want.height && (best == null || o.height > best.height)) {
+                  best = o;
+                }
+              }
+              return best ?? (inf.options.isNotEmpty ? inf.options.last : null);
+            }
+
+            // تشغيل كل المحركات معاً: أول نتيجة تنتظر 1.5 ثانية للباقي ثم نختار الأعلى دقة، وبقية المحركات تبقى احتياطاً
+            _YtResolver _resolveYoutube(String id) {
+              final r = _YtResolver();
+              int pending = 4;
               Timer? grace;
 
-              void finish() {
-                if (c.isCompleted) return;
+              void finishFirst() {
+                if (r.first.isCompleted) return;
                 grace?.cancel();
-                if (got.isEmpty) {
-                  c.complete(null);
+                if (r.infos.isEmpty) {
+                  r.first.complete(null);
                   return;
                 }
-                got.sort((a, b) => b.bestHeight.compareTo(a.bestHeight));
-                c.complete(got.first);
+                final best = [...r.infos]
+                  ..sort((a, b) => b.bestHeight.compareTo(a.bestHeight));
+                r.first.complete(best.first);
               }
 
-              void done(_YtInfo? r) {
-                if (r != null && r.options.isNotEmpty) {
-                  got.add(r);
-                  grace ??= Timer(const Duration(milliseconds: 1500), finish);
+              void done(_YtInfo? x) {
+                if (x != null && x.options.isNotEmpty) {
+                  r.infos.add(x);
+                  grace ??= Timer(const Duration(milliseconds: 1500), finishFirst);
                 }
                 pending--;
-                if (pending == 0) finish();
+                if (pending == 0) {
+                  finishFirst();
+                  if (!r.all.isCompleted) r.all.complete();
+                }
               }
 
-              for (final f in [
-                _ytViaLibrary(id),
-                _ytViaInnerTube(id, 0),
-                _ytViaInnerTube(id, 1),
-              ]) {
-                f.then(done).catchError((_) {
+              void run(String name, Future<_YtInfo?> f) {
+                f.then((x) {
+                  if (x == null || x.options.isEmpty) _ytLog.add('$name: لا توجد صيغ');
+                  done(x);
+                }).catchError((e) {
+                  _ytLog.add('$name: ${_short(e)}');
                   done(null);
                 });
               }
-              Future.delayed(const Duration(seconds: 25), finish);
-              return c.future;
+
+              run('youtube_explode', _ytViaLibrary(id));
+              run('ANDROID_VR', _ytViaInnerTube(id, 0));
+              run('IOS', _ytViaInnerTube(id, 1));
+              run('Piped', _ytViaPiped(id));
+
+              Future.delayed(const Duration(seconds: 25), () {
+                finishFirst();
+                if (!r.all.isCompleted) r.all.complete();
+              });
+              return r;
             }
 
             Future<_YtOption?> _chooseYoutubeQuality(
@@ -2286,27 +2422,29 @@ jobs:
               final id = _ytId(url);
               if (id == null) throw Exception('رابط يوتيوب غير صالح');
 
+              _ytLog.clear();
               setState(() =>
                   _statusText = 'جاري جلب روابط الفيديو بعدة محركات بالتوازي...');
               final titleF = _ytTitle(id);
-              final info = await _resolveYoutube(id);
+              final rs = _resolveYoutube(id);
+              final first = await rs.first.future;
               if (_cancelRequested) throw Exception('تم إيقاف التنزيل');
 
-              if (info != null) {
-                String? t = info.title;
+              if (first != null) {
+                String? t = first.title;
                 t ??= await titleF;
                 _lastYtTitle = t ?? 'فيديو يوتيوب';
                 _notifTitle = _lastYtTitle;
 
                 // الشورتس/الريلز (رابط /shorts/ أو مدة دقيقة تقريباً): أعلى دقة مباشرة بدون سؤال
                 final isShort = url.contains('/shorts/') ||
-                    (info.seconds > 0 && info.seconds <= 75);
-                _YtOption chosen = info.options.first;
+                    (first.seconds > 0 && first.seconds <= 75);
+                _YtOption chosen = first.options.first;
                 if (!isShort) {
                   final c = await _chooseYoutubeQuality(
                       _lastYtTitle,
-                      info.seconds > 0 ? Duration(seconds: info.seconds) : null,
-                      info.options);
+                      first.seconds > 0 ? Duration(seconds: first.seconds) : null,
+                      first.options);
                   if (c == null) throw Exception('تم إلغاء التنزيل');
                   chosen = c;
                 }
@@ -2315,21 +2453,47 @@ jobs:
                 if (_notifActive) {
                   DownloadNotifier.update(0, _lastYtTitle).catchError((_) {});
                 }
-                setState(() {
-                  _progress = 0;
-                  _statusText = 'جاري تنزيل: $_lastYtTitle  (${info.engine})';
-                });
 
-                try {
-                  if (await _downloadYoutubeOption(chosen, savePath)) return true;
-                } catch (_) {
-                  if (_cancelRequested) rethrow;
+                // نجرّب نتيجة كل محرك بالترتيب: إن فشل التنزيل من رابط محرك ننتقل لرابط المحرك التالي
+                Future<bool> attempt(_YtInfo inf) async {
+                  final o = _matchOption(inf, chosen);
+                  if (o == null) {
+                    _ytLog.add('${inf.engine}: لا توجد دقة مطابقة');
+                    return false;
+                  }
+                  setState(() {
+                    _progress = 0;
+                    _statusText = 'جاري تنزيل: $_lastYtTitle  (${inf.engine} - ${o.label})';
+                  });
+                  try {
+                    if (await _downloadYoutubeOption(o, savePath)) return true;
+                    _ytLog.add('${inf.engine}: الملف غير صالح بعد التنزيل');
+                  } catch (e) {
+                    if (_cancelRequested) rethrow;
+                    _ytLog.add('تنزيل ${inf.engine}: ${_short(e)}');
+                  }
+                  final f = File(savePath);
+                  if (await f.exists()) await f.delete();
+                  return false;
                 }
-                final f = File(savePath);
-                if (await f.exists()) await f.delete();
+
+                final tried = <_YtInfo>[first];
+                if (await attempt(first)) return true;
+
+                // ننتظر بقية المحركات (إن لم تنتهِ) ثم نجرّبها واحداً واحداً
+                await rs.all.future.timeout(const Duration(seconds: 25), onTimeout: () {});
+                for (final inf in List<_YtInfo>.of(rs.infos)) {
+                  if (tried.contains(inf)) continue;
+                  if (_cancelRequested) throw Exception('تم إيقاف التنزيل');
+                  tried.add(inf);
+                  if (await attempt(inf)) return true;
+                }
               }
 
-              return _youtubeFallbackEngines(url, savePath);
+              if (_cancelRequested) throw Exception('تم إيقاف التنزيل');
+              if (await _youtubeFallbackEngines(url, savePath)) return true;
+              _ytLog.add('المحركات الاحتياطية (خادمك/APIs): فشلت');
+              throw Exception("فشلت كل محركات يوتيوب:\n${_ytLog.join('\n')}");
             }
 
             // مفتاح موحّد للفيديو لاكتشاف التكرار (بدون عوامل التتبع في الرابط)
