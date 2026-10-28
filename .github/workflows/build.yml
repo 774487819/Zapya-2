@@ -967,18 +967,46 @@ jobs:
                 );
           }
 
-          // خيار دقة يوتيوب: إما فيديو + صوت منفصلين (دقة عالية) أو ملف مدمج جاهز (360p)
+          // خيار دقة يوتيوب: فيديو (+ صوت منفصل للدقات العالية) مع روابطه وأحجامه
           class _YtOption {
             final String label;
-            final VideoOnlyStreamInfo? video;
-            final AudioOnlyStreamInfo? audio;
-            final MuxedStreamInfo? muxed;
-            _YtOption(this.label, {this.video, this.audio, this.muxed});
+            final int height;
+            final Uri videoUrl;
+            final int videoBytes;
+            final StreamInfo? videoInfo;
+            final Uri? audioUrl;
+            final int audioBytes;
+            final StreamInfo? audioInfo;
+            final Map<String, String> headers;
 
-            int get bytes => muxed != null
-                ? muxed!.size.totalBytes
-                : video!.size.totalBytes + audio!.size.totalBytes;
+            _YtOption(
+              this.label, {
+              required this.height,
+              required this.videoUrl,
+              required this.videoBytes,
+              this.videoInfo,
+              this.audioUrl,
+              this.audioBytes = 0,
+              this.audioInfo,
+              this.headers = const {},
+            });
+
+            bool get hasAudio => audioUrl != null;
+            int get bytes => videoBytes + audioBytes;
             double get mb => bytes / (1024 * 1024);
+          }
+
+          // نتيجة أحد محركات الاستخراج (العنوان + المدة + الدقات المتاحة)
+          class _YtInfo {
+            final String? title;
+            final int seconds;
+            final List<_YtOption> options;
+            final String engine;
+            _YtInfo(this.title, this.seconds, this.options, this.engine);
+
+            int get bestHeight => options.isEmpty
+                ? 0
+                : options.map((o) => o.height).reduce((a, b) => a > b ? a : b);
           }
 
           // ================= تصميم الواجهة الجديد: ألوان ومكوّنات مساعدة =================
@@ -1708,7 +1736,7 @@ jobs:
               return false;
             }
 
-            // ================= يوتيوب: دقات عالية (1080p+) + تنزيل متوازي سريع =================
+            // ================= يوتيوب: عدة محركات بالتوازي + دقات عالية + تنزيل متوازي سريع =================
             // استخراج معرّف الفيديو (11 حرفاً) من أي صيغة رابط: watch / youtu.be / shorts
             String? _ytId(String url) {
               final m = RegExp(
@@ -1717,8 +1745,29 @@ jobs:
               return m?.group(1);
             }
 
-            // الدقات العالية = فيديو H.264 منفصل + صوت AAC منفصل (يُدمجان أصلياً بعد التنزيل)
-            List<_YtOption> _buildYtOptions(StreamManifest m) {
+            // عنوان الفيديو بسرعة عبر oEmbed (لا ينتظر المحركات الثقيلة)
+            Future<String?> _ytTitle(String id) async {
+              try {
+                final r = await _dio
+                    .get(
+                      'https://www.youtube.com/oembed',
+                      queryParameters: {
+                        'url': 'https://www.youtube.com/watch?v=$id',
+                        'format': 'json',
+                      },
+                    )
+                    .timeout(const Duration(seconds: 6));
+                final d = r.data is String ? jsonDecode(r.data) : r.data;
+                if (d is Map && d['title'] != null) return d['title'].toString();
+              } catch (_) {}
+              return null;
+            }
+
+            // المحرك 1: مكتبة youtube_explode
+            Future<_YtInfo?> _ytViaLibrary(String id) async {
+              final m = await _yt.videos.streamsClient
+                  .getManifest(id)
+                  .timeout(const Duration(seconds: 25));
               final res = <_YtOption>[];
 
               final audios = m.audioOnly
@@ -1727,24 +1776,38 @@ jobs:
                   .toList()
                 ..sort((a, b) => b.bitrate.bitsPerSecond.compareTo(a.bitrate.bitsPerSecond));
 
+              int secs = 0;
               if (audios.isNotEmpty) {
+                final a = audios.first;
+                if (a.bitrate.bitsPerSecond > 0) {
+                  secs = (a.size.totalBytes * 8 / a.bitrate.bitsPerSecond).round();
+                }
                 final vids = m.videoOnly
                     .where((v) =>
                         v.container.name == 'mp4' && v.videoCodec.startsWith('avc1'))
                     .toList()
-                  ..sort((a, b) {
-                    final c = b.videoResolution.height.compareTo(a.videoResolution.height);
-                    return c != 0 ? c : b.size.totalBytes.compareTo(a.size.totalBytes);
+                  ..sort((x, y) {
+                    final c = y.videoResolution.height.compareTo(x.videoResolution.height);
+                    return c != 0 ? c : y.size.totalBytes.compareTo(x.size.totalBytes);
                   });
                 final seen = <String>{};
                 for (final v in vids) {
                   if (seen.add(v.videoQualityLabel)) {
-                    res.add(_YtOption(v.videoQualityLabel, video: v, audio: audios.first));
+                    res.add(_YtOption(
+                      v.videoQualityLabel,
+                      height: v.videoResolution.height,
+                      videoUrl: v.url,
+                      videoBytes: v.size.totalBytes,
+                      videoInfo: v,
+                      audioUrl: a.url,
+                      audioBytes: a.size.totalBytes,
+                      audioInfo: a,
+                    ));
                   }
                 }
               }
 
-              // احتياط: إن لم تتوفر صيغ عالية نستخدم الصيغ المدمجة (غالباً 360p)
+              // احتياط: صيغ مدمجة (غالباً 360p)
               if (res.isEmpty) {
                 final mux = m.muxed.toList()
                   ..sort((a, b) =>
@@ -1752,11 +1815,156 @@ jobs:
                 final seen = <String>{};
                 for (final s in mux) {
                   if (seen.add(s.videoQualityLabel)) {
-                    res.add(_YtOption(s.videoQualityLabel, muxed: s));
+                    res.add(_YtOption(
+                      s.videoQualityLabel,
+                      height: s.videoResolution.height,
+                      videoUrl: s.url,
+                      videoBytes: s.size.totalBytes,
+                      videoInfo: s,
+                    ));
                   }
                 }
               }
-              return res;
+              return _YtInfo(null, secs, res, 'youtube_explode');
+            }
+
+            // المحركان 2 و3: طلب مباشر لواجهة يوتيوب الداخلية (عميل ANDROID_VR وعميل IOS)
+            Future<_YtInfo?> _ytViaInnerTube(String id, int which) async {
+              final vr = which == 0;
+              final ua = vr
+                  ? 'com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip'
+                  : 'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)';
+              final client = <String, dynamic>{
+                'clientName': vr ? 'ANDROID_VR' : 'IOS',
+                'clientVersion': vr ? '1.62.27' : '20.10.4',
+                'deviceMake': vr ? 'Oculus' : 'Apple',
+                'deviceModel': vr ? 'Quest 3' : 'iPhone16,2',
+                'osName': vr ? 'Android' : 'iPhone',
+                'osVersion': vr ? '12L' : '18.3.2.22D82',
+                'userAgent': ua,
+                'hl': 'en',
+                'timeZone': 'UTC',
+                'utcOffsetMinutes': 0,
+              };
+              if (vr) client['androidSdkVersion'] = 32;
+
+              final res = await _dio.post(
+                'https://www.youtube.com/youtubei/v1/player?prettyPrint=false',
+                data: jsonEncode({
+                  'context': {'client': client},
+                  'videoId': id,
+                  'contentCheckOk': true,
+                  'racyCheckOk': true,
+                }),
+                options: Options(
+                  contentType: 'application/json',
+                  headers: {
+                    'User-Agent': ua,
+                    'X-YouTube-Client-Name': vr ? '28' : '5',
+                    'X-YouTube-Client-Version': vr ? '1.62.27' : '20.10.4',
+                    'Origin': 'https://www.youtube.com',
+                  },
+                  receiveTimeout: const Duration(seconds: 12),
+                ),
+              );
+              final data = res.data is String ? jsonDecode(res.data) : res.data;
+              if (data is! Map) return null;
+              final ps = data['playabilityStatus'];
+              if (ps is Map && ps['status'] != 'OK') return null;
+              final sd = data['streamingData'];
+              if (sd is! Map) return null;
+
+              Map? bestAudio;
+              int bestBr = -1;
+              final vids = <Map>[];
+              for (final e in ((sd['adaptiveFormats'] as List?) ?? const [])) {
+                if (e is! Map || e['url'] == null) continue;
+                final mt = '${e['mimeType']}';
+                final len = int.tryParse('${e['contentLength']}') ?? 0;
+                if (len <= 0) continue;
+                if (mt.startsWith('audio/mp4')) {
+                  final br = ((e['bitrate'] ?? 0) as num).toInt();
+                  if (br > bestBr) {
+                    bestBr = br;
+                    bestAudio = e;
+                  }
+                } else if (mt.startsWith('video/mp4') && mt.contains('avc1')) {
+                  vids.add(e);
+                }
+              }
+              final audio = bestAudio;
+              if (audio == null || vids.isEmpty) return null;
+
+              vids.sort((a, b) => ((b['height'] ?? 0) as num)
+                  .toInt()
+                  .compareTo(((a['height'] ?? 0) as num).toInt()));
+
+              final headers = <String, String>{'User-Agent': ua};
+              final opts = <_YtOption>[];
+              final seen = <String>{};
+              for (final v in vids) {
+                final h = ((v['height'] ?? 0) as num).toInt();
+                final label = '${v['qualityLabel'] ?? '${h}p'}';
+                if (!seen.add(label)) continue;
+                opts.add(_YtOption(
+                  label,
+                  height: h,
+                  videoUrl: Uri.parse('${v['url']}'),
+                  videoBytes: int.parse('${v['contentLength']}'),
+                  audioUrl: Uri.parse('${audio['url']}'),
+                  audioBytes: int.parse('${audio['contentLength']}'),
+                  headers: headers,
+                ));
+              }
+
+              String? title;
+              int secs = 0;
+              final vd = data['videoDetails'];
+              if (vd is Map) {
+                title = vd['title']?.toString();
+                secs = int.tryParse('${vd['lengthSeconds']}') ?? 0;
+              }
+              return _YtInfo(title, secs, opts, vr ? 'ANDROID_VR' : 'IOS');
+            }
+
+            // تشغيل كل المحركات معاً: أول نتيجة تصل تنتظر 1.5 ثانية للباقي ثم نختار الأعلى دقة
+            Future<_YtInfo?> _resolveYoutube(String id) {
+              final c = Completer<_YtInfo?>();
+              final got = <_YtInfo>[];
+              int pending = 3;
+              Timer? grace;
+
+              void finish() {
+                if (c.isCompleted) return;
+                grace?.cancel();
+                if (got.isEmpty) {
+                  c.complete(null);
+                  return;
+                }
+                got.sort((a, b) => b.bestHeight.compareTo(a.bestHeight));
+                c.complete(got.first);
+              }
+
+              void done(_YtInfo? r) {
+                if (r != null && r.options.isNotEmpty) {
+                  got.add(r);
+                  grace ??= Timer(const Duration(milliseconds: 1500), finish);
+                }
+                pending--;
+                if (pending == 0) finish();
+              }
+
+              for (final f in [
+                _ytViaLibrary(id),
+                _ytViaInnerTube(id, 0),
+                _ytViaInnerTube(id, 1),
+              ]) {
+                f.then(done).catchError((_) {
+                  done(null);
+                });
+              }
+              Future.delayed(const Duration(seconds: 25), finish);
+              return c.future;
             }
 
             Future<_YtOption?> _chooseYoutubeQuality(
@@ -1820,21 +2028,30 @@ jobs:
               );
             }
 
-            // تنزيل سريع: نقسّم الملف إلى أجزاء ونحمّل 6 أجزاء بالتوازي (يوتيوب يبطّئ الاتصال الواحد)
-            Future<void> _downloadRanged(
-                Uri url, String path, int total, void Function(int) onBytes) async {
+            // تنزيل متوازي: 4 اتصالات بأجزاء 2MB، مع "حارس توقف": إن لم يصل أي بايت 10 ثوانٍ نوقفه وننتقل للطريقة التالية
+            Future<void> _downloadRanged(Uri url, String path, int total,
+                Map<String, String> headers, void Function(int) onBytes) async {
               final f = File(path);
               if (await f.exists()) await f.delete();
               final raf = await f.open(mode: FileMode.write);
               bool failed = false;
+              DateTime last = DateTime.now();
+              final tok = CancelToken();
+              final watchdog = Timer.periodic(const Duration(seconds: 1), (_) {
+                if (_cancelRequested ||
+                    DateTime.now().difference(last).inSeconds >= 10) {
+                  failed = true;
+                  if (!tok.isCancelled) tok.cancel('stall');
+                }
+              });
               try {
                 await raf.truncate(total);
-                const chunk = 3 * 1024 * 1024;
+                const chunk = 2 * 1024 * 1024;
                 int next = 0;
 
                 Future<void> worker() async {
                   try {
-                    while (!_cancelRequested && !failed) {
+                    while (!failed) {
                       final start = next;
                       if (start >= total) return;
                       next += chunk;
@@ -1848,8 +2065,12 @@ jobs:
                         try {
                           final res = await _dio.getUri<List<int>>(
                             u,
-                            options: Options(responseType: ResponseType.bytes),
-                            cancelToken: _cancelToken,
+                            options: Options(
+                              responseType: ResponseType.bytes,
+                              headers: headers,
+                              receiveTimeout: const Duration(seconds: 12),
+                            ),
+                            cancelToken: tok,
                           );
                           final code = res.statusCode ?? 0;
                           final d = res.data;
@@ -1866,6 +2087,7 @@ jobs:
                       if (failed) return;
                       raf.setPositionSync(start);
                       raf.writeFromSync(data);
+                      last = DateTime.now();
                       onBytes(data.length);
                     }
                   } catch (_) {
@@ -1874,96 +2096,111 @@ jobs:
                   }
                 }
 
-                await Future.wait(List.generate(6, (_) => worker()));
+                await Future.wait(List.generate(4, (_) => worker()));
               } finally {
+                watchdog.cancel();
                 await raf.close();
               }
               if (_cancelRequested) throw Exception('تم إيقاف التنزيل');
+              if (failed) throw Exception('stalled');
             }
 
-            Future<void> _fetchStream(
-                StreamInfo info, String path, void Function(int) onBytes) async {
+            // تنزيل ملف واحد بثلاث طرق متتالية: متوازي ← مكتبة يوتيوب (إن وُجدت) ← اتصال واحد عادي
+            Future<void> _fetchOne(Uri url, int bytes, String path,
+                Map<String, String> headers, StreamInfo? lib, void Function(int) onBytes) async {
               int counted = 0;
               void add(int n) {
                 counted += n;
                 onBytes(n);
               }
 
+              Future<void> checkSize() async {
+                final len = await File(path).length();
+                if (len < bytes * 0.97) throw Exception('الملف ناقص');
+              }
+
+              // 1) متوازي
               try {
-                await _downloadRanged(info.url, path, info.size.totalBytes, add);
+                await _downloadRanged(url, path, bytes, headers, add);
                 return;
               } catch (_) {
                 if (_cancelRequested) rethrow;
               }
-
-              // احتياط: التنزيل المتسلسل العادي إذا فشل التنزيل المتوازي
               onBytes(-counted);
               counted = 0;
+              if (mounted) {
+                setState(() => _statusText = 'التنزيل المتوازي تعثّر، جارٍ استخدام طريقة أخرى...');
+              }
+
+              // 2) مكتبة يوتيوب (مع مهلة توقف 20 ثانية)
+              if (lib != null) {
+                try {
+                  final f = File(path);
+                  if (await f.exists()) await f.delete();
+                  final sink = f.openWrite();
+                  try {
+                    await for (final chunk in _yt.videos.streamsClient
+                        .get(lib)
+                        .timeout(const Duration(seconds: 20))) {
+                      if (_cancelRequested) break;
+                      sink.add(chunk);
+                      add(chunk.length);
+                    }
+                  } finally {
+                    await sink.close();
+                  }
+                  if (_cancelRequested) throw Exception('تم إيقاف التنزيل');
+                  await checkSize();
+                  return;
+                } catch (_) {
+                  if (_cancelRequested) rethrow;
+                  onBytes(-counted);
+                  counted = 0;
+                }
+              }
+
+              // 3) اتصال واحد عادي
               final f = File(path);
               if (await f.exists()) await f.delete();
-              final sink = f.openWrite();
-              try {
-                await for (final chunk in _yt.videos.streamsClient.get(info)) {
-                  if (_cancelRequested) break;
-                  sink.add(chunk);
-                  add(chunk.length);
-                }
-              } finally {
-                await sink.close();
-              }
+              await _dio.download(
+                url.toString(),
+                path,
+                cancelToken: _cancelToken,
+                options: Options(
+                  headers: headers,
+                  receiveTimeout: const Duration(seconds: 20),
+                ),
+                onReceiveProgress: (r, t) {
+                  final d = r - counted;
+                  if (d > 0) add(d);
+                },
+              );
               if (_cancelRequested) throw Exception('تم إيقاف التنزيل');
+              await checkSize();
             }
 
-            Future<bool> _downloadYoutube(String url, String savePath) async {
-              final id = _ytId(url);
-              if (id == null) throw Exception('رابط يوتيوب غير صالح');
-
-              setState(() => _statusText = 'جاري قراءة معلومات الفيديو...');
-              final video = await _yt.videos.get(id);
-              _lastYtTitle = video.title;
-              _notifTitle = video.title;
-              final manifest = await _yt.videos.streamsClient.getManifest(id);
-
-              final options = _buildYtOptions(manifest);
-              if (options.isEmpty) throw Exception('لا توجد صيغ متاحة لهذا الفيديو');
-
-              // الشورتس/الريلز (رابط /shorts/ أو مدة 60 ثانية فأقل): أعلى دقة مباشرة بدون سؤال
-              final isShort = url.contains('/shorts/') ||
-                  (video.duration != null && video.duration!.inSeconds <= 60);
-              _YtOption chosen = options.first;
-              if (!isShort) {
-                final c =
-                    await _chooseYoutubeQuality(video.title, video.duration, options);
-                if (c == null) throw Exception('تم إلغاء التنزيل');
-                chosen = c;
-              }
-              if (_cancelRequested) throw Exception('تم إيقاف التنزيل');
-
-              if (_notifActive) {
-                DownloadNotifier.update(0, video.title).catchError((_) {});
-              }
-              setState(() {
-                _progress = 0;
-                _statusText = 'جاري تنزيل: ${video.title}';
-              });
-
-              final total = chosen.bytes;
+            Future<bool> _downloadYoutubeOption(_YtOption o, String savePath) async {
+              final total = o.bytes;
               int got = 0;
               void onBytes(int n) {
                 got += n;
-                _setProgress((got / total).clamp(0.0, 1.0));
+                if (got < 0) got = 0;
+                _setProgress((got / total).clamp(0.0, 1.0).toDouble());
               }
 
               final vPath = '$savePath.v.mp4';
               final aPath = '$savePath.a.m4a';
               try {
-                if (chosen.muxed != null) {
-                  await _fetchStream(chosen.muxed!, savePath, onBytes);
+                if (!o.hasAudio) {
+                  await _fetchOne(
+                      o.videoUrl, o.videoBytes, savePath, o.headers, o.videoInfo, onBytes);
                 } else {
                   // الفيديو والصوت يُنزَّلان معاً في نفس الوقت
                   await Future.wait([
-                    _fetchStream(chosen.video!, vPath, onBytes),
-                    _fetchStream(chosen.audio!, aPath, onBytes),
+                    _fetchOne(
+                        o.videoUrl, o.videoBytes, vPath, o.headers, o.videoInfo, onBytes),
+                    _fetchOne(
+                        o.audioUrl!, o.audioBytes, aPath, o.headers, o.audioInfo, onBytes),
                   ]);
                   if (_cancelRequested) throw Exception('تم إيقاف التنزيل');
                   setState(() => _statusText = 'جاري دمج الصورة والصوت...');
@@ -2007,6 +2244,92 @@ jobs:
                 return false;
               }
               return true;
+            }
+
+            // محركات احتياطية ليوتيوب: خادمك الخاص (yt-dlp) ثم APIs سحابية (غير مضمونة)
+            Future<bool> _youtubeFallbackEngines(String url, String savePath) async {
+              setState(() {
+                _progress = 0;
+                _statusText = 'جاري تجربة محركات بديلة ليوتيوب...';
+              });
+              final custom = await _tryCustomServer(url);
+              if (custom != null &&
+                  await _tryDownloadAndVerifyVideo(custom, savePath, false, 'الخادم الخاص')) {
+                return true;
+              }
+
+              final encoded = Uri.encodeComponent(url);
+              final apis = [
+                'https://api.siputzx.my.id/api/d/ytmp4?url=$encoded',
+                'https://api.vreden.my.id/api/ytmp4?url=$encoded',
+                'https://api.ryzendesu.vip/api/downloader/ytdl?url=$encoded',
+              ];
+              for (final apiUrl in apis) {
+                if (_cancelRequested) throw Exception('تم إيقاف التنزيل');
+                try {
+                  final res = await _dio.get(
+                    apiUrl,
+                    options: Options(responseType: ResponseType.bytes),
+                  );
+                  final raw = utf8.decode(res.data, allowMalformed: true);
+                  for (final u in _extractAllValidVideoUrls(raw)) {
+                    if (await _tryDownloadAndVerifyVideo(u, savePath, false, 'api سحابي')) {
+                      return true;
+                    }
+                  }
+                } catch (_) {}
+              }
+              return false;
+            }
+
+            Future<bool> _downloadYoutube(String url, String savePath) async {
+              final id = _ytId(url);
+              if (id == null) throw Exception('رابط يوتيوب غير صالح');
+
+              setState(() =>
+                  _statusText = 'جاري جلب روابط الفيديو بعدة محركات بالتوازي...');
+              final titleF = _ytTitle(id);
+              final info = await _resolveYoutube(id);
+              if (_cancelRequested) throw Exception('تم إيقاف التنزيل');
+
+              if (info != null) {
+                String? t = info.title;
+                t ??= await titleF;
+                _lastYtTitle = t ?? 'فيديو يوتيوب';
+                _notifTitle = _lastYtTitle;
+
+                // الشورتس/الريلز (رابط /shorts/ أو مدة دقيقة تقريباً): أعلى دقة مباشرة بدون سؤال
+                final isShort = url.contains('/shorts/') ||
+                    (info.seconds > 0 && info.seconds <= 75);
+                _YtOption chosen = info.options.first;
+                if (!isShort) {
+                  final c = await _chooseYoutubeQuality(
+                      _lastYtTitle,
+                      info.seconds > 0 ? Duration(seconds: info.seconds) : null,
+                      info.options);
+                  if (c == null) throw Exception('تم إلغاء التنزيل');
+                  chosen = c;
+                }
+                if (_cancelRequested) throw Exception('تم إيقاف التنزيل');
+
+                if (_notifActive) {
+                  DownloadNotifier.update(0, _lastYtTitle).catchError((_) {});
+                }
+                setState(() {
+                  _progress = 0;
+                  _statusText = 'جاري تنزيل: $_lastYtTitle  (${info.engine})';
+                });
+
+                try {
+                  if (await _downloadYoutubeOption(chosen, savePath)) return true;
+                } catch (_) {
+                  if (_cancelRequested) rethrow;
+                }
+                final f = File(savePath);
+                if (await f.exists()) await f.delete();
+              }
+
+              return _youtubeFallbackEngines(url, savePath);
             }
 
             // مفتاح موحّد للفيديو لاكتشاف التكرار (بدون عوامل التتبع في الرابط)
