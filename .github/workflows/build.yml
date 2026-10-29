@@ -772,41 +772,42 @@ jobs:
             Future<bool> _single(String url, String path, Map<String, String> headers) async {
               final file = File(path);
               final client = HttpClient()..connectionTimeout = const Duration(seconds: 12);
-              IOSink? sink;
+              final IOSink sink = file.openWrite();
+              var ok = false;
               try {
                 final req = await client.getUrl(Uri.parse(url));
                 headers.forEach((k, v) => req.headers.set(k, v));
                 final res = await req.close();
-                if (res.statusCode != 200) {
-                  await res.drain();
-                  return false;
-                }
-                sink = file.openWrite();
-                await for (final data in res) {
-                  if (cancelled()) {
-                    await sink.close();
-                    sink = null;
-                    try {
-                      await file.delete();
-                    } catch (_) {}
-                    return false;
+                if (res.statusCode == 200) {
+                  var stopped = false;
+                  await for (final data in res) {
+                    if (cancelled()) {
+                      stopped = true;
+                      break;
+                    }
+                    sink.add(data);
+                    onBytes(data.length);
                   }
-                  sink.add(data);
-                  onBytes(data.length);
+                  ok = !stopped;
+                } else {
+                  await res.drain();
                 }
-                await sink.flush();
-                await sink.close();
-                sink = null;
-                return true;
               } catch (_) {
-                try {
-                  await sink?.close();
-                  await file.delete();
-                } catch (_) {}
-                return false;
-              } finally {
-                client.close(force: true);
+                ok = false;
               }
+              try {
+                await sink.flush();
+              } catch (_) {}
+              try {
+                await sink.close();
+              } catch (_) {}
+              client.close(force: true);
+              if (!ok) {
+                try {
+                  if (await file.exists()) await file.delete();
+                } catch (_) {}
+              }
+              return ok;
             }
           }
 
@@ -934,7 +935,7 @@ jobs:
 
             // 3) مكتبة youtube_explode_dart (ديناميكي لتجنب مشاكل تغيّر الواجهة بين الإصدارات)
             Future<YtInfo?> explode(String id) async {
-              final yt = YoutubeExplode();
+              final dynamic yt = YoutubeExplode();
               try {
                 final dynamic video = await yt.videos.get('https://www.youtube.com/watch?v=$id');
                 final dynamic m = await yt.videos.streamsClient.getManifest(id);
@@ -1608,7 +1609,8 @@ jobs:
               _lastUi = now;
               final secs = max(_sw.elapsedMilliseconds / 1000.0, 0.001);
               final mbps = (_doneBytes / (1024 * 1024)) / secs;
-              final frac = _totalBytes > 0 ? (_doneBytes / _totalBytes).clamp(0.0, 1.0) : 0.0;
+              final double frac =
+                  _totalBytes > 0 ? (_doneBytes / _totalBytes).clamp(0.0, 1.0).toDouble() : 0.0;
               final pct = (frac * 100).floor();
               if (mounted) {
                 setState(() {
@@ -2066,6 +2068,12 @@ jobs:
                 );
           }
           EOF
+
+      - name: Analyze (prints Dart errors clearly in the log)
+        continue-on-error: true
+        run: |
+          cd yt_build
+          flutter analyze --no-fatal-infos --no-fatal-warnings 2>&1 | grep -E "error|Error" | head -40 || true
 
       - name: Build Release APK
         run: |
