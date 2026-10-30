@@ -29,15 +29,107 @@ jobs:
           cd yt_build
           flutter pub add dio shared_preferences path_provider youtube_explode_dart
 
-      - name: Configure Android Manifest & Strings
+      - name: Add yt-dlp engine to Gradle (Python + ffmpeg + aria2c inside the app)
+        run: |
+
+          cat << 'EOF' > gradle_patch.py
+          import os, sys
+
+          base = 'yt_build/android/app'
+          kts = os.path.join(base, 'build.gradle.kts')
+          grv = os.path.join(base, 'build.gradle')
+
+          KTS_EXTRA = '''
+
+          // ===== إضافات محرك yt-dlp (تُلحق تلقائياً) =====
+          android {
+              defaultConfig {
+                  minSdk = 24
+              }
+              packaging {
+                  jniLibs {
+                      useLegacyPackaging = true
+                  }
+              }
+              buildTypes {
+                  getByName("release") {
+                      isMinifyEnabled = false
+                      isShrinkResources = false
+                  }
+              }
+          }
+
+          dependencies {
+              implementation("io.github.junkfood02.youtubedl-android:library:0.17.+")
+              implementation("io.github.junkfood02.youtubedl-android:ffmpeg:0.17.+")
+              implementation("io.github.junkfood02.youtubedl-android:aria2c:0.17.+")
+          }
+          '''
+
+          GRV_EXTRA = '''
+
+          // ===== إضافات محرك yt-dlp (تُلحق تلقائياً) =====
+          android {
+              defaultConfig {
+                  minSdkVersion 24
+              }
+              packagingOptions {
+                  jniLibs {
+                      useLegacyPackaging = true
+                  }
+              }
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                      shrinkResources false
+                  }
+              }
+          }
+
+          dependencies {
+              implementation "io.github.junkfood02.youtubedl-android:library:0.17.+"
+              implementation "io.github.junkfood02.youtubedl-android:ffmpeg:0.17.+"
+              implementation "io.github.junkfood02.youtubedl-android:aria2c:0.17.+"
+          }
+          '''
+
+          if os.path.exists(kts):
+              path, extra = kts, KTS_EXTRA
+          elif os.path.exists(grv):
+              path, extra = grv, GRV_EXTRA
+          else:
+              print('ERROR: no app gradle file found')
+              sys.exit(1)
+
+          with open(path, 'a', encoding='utf-8') as f:
+              f.write(extra)
+          print('PATCHED', path)
+          print(open(path, encoding='utf-8').read())
+          EOF
+
+          python3 gradle_patch.py
+
+      - name: Configure Android Manifest, Strings and Accessibility
         run: |
           mkdir -p yt_build/android/app/src/main/res/values
-
+          mkdir -p yt_build/android/app/src/main/res/xml
           cat << 'EOF' > yt_build/android/app/src/main/res/values/strings.xml
           <?xml version="1.0" encoding="utf-8"?>
           <resources>
               <string name="app_name">محمّل يوتيوب السريع</string>
+              <string name="acc_desc">يكتشف النقر المزدوج خلف الهاتف أثناء استخدام تطبيق يوتيوب فقط، ثم ينسخ رابط الفيديو ويحمّله تلقائياً</string>
           </resources>
+          EOF
+
+          cat << 'EOF' > yt_build/android/app/src/main/res/xml/accessibility_service_config.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault|flagIncludeNotImportantViews|flagReportViewIds|flagRetrieveInteractiveWindows"
+              android:canRetrieveWindowContent="true"
+              android:description="@string/acc_desc"
+              android:notificationTimeout="100" />
           EOF
 
           cat << 'EOF' > yt_build/android/app/src/main/AndroidManifest.xml
@@ -48,6 +140,8 @@ jobs:
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
               <uses-permission android:name="android.permission.WAKE_LOCK"/>
+              <uses-permission android:name="android.permission.VIBRATE"/>
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
 
               <application
                   android:label="@string/app_name"
@@ -83,6 +177,18 @@ jobs:
                       android:exported="false"
                       android:foregroundServiceType="dataSync" />
 
+                  <service
+                      android:name=".AutoYtGrabberService"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+                      android:exported="false">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_service_config" />
+                  </service>
+
                   <meta-data
                       android:name="flutterEmbedding"
                       android:value="2" />
@@ -90,23 +196,31 @@ jobs:
           </manifest>
           EOF
 
-      - name: Write Native Kotlin (muxer + gallery + notification service)
+      - name: Write Native Kotlin (yt-dlp, back-tap service, muxer, notification)
         run: |
           mkdir -p yt_build/android/app/src/main/kotlin/com/ytsaver/yt_saver_app
           cat << 'EOF' > yt_build/android/app/src/main/kotlin/com/ytsaver/yt_saver_app/MainActivity.kt
           package com.ytsaver.yt_saver_app
 
           import android.Manifest
+          import android.accessibilityservice.AccessibilityService
           import android.app.Notification
           import android.app.NotificationChannel
           import android.app.NotificationManager
           import android.app.PendingIntent
           import android.app.Service
+          import android.content.ClipboardManager
+          import android.content.ComponentName
           import android.content.ContentValues
           import android.content.Context
           import android.content.Intent
           import android.content.pm.PackageManager
           import android.content.pm.ServiceInfo
+          import android.graphics.Rect
+          import android.hardware.Sensor
+          import android.hardware.SensorEvent
+          import android.hardware.SensorEventListener
+          import android.hardware.SensorManager
           import android.media.MediaCodec
           import android.media.MediaExtractor
           import android.media.MediaFormat
@@ -115,8 +229,19 @@ jobs:
           import android.os.Build
           import android.os.Bundle
           import android.os.Environment
+          import android.os.Handler
           import android.os.IBinder
+          import android.os.Looper
+          import android.os.VibrationEffect
+          import android.os.Vibrator
           import android.provider.MediaStore
+          import android.provider.Settings
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+          import com.yausername.aria2c.Aria2c
+          import com.yausername.ffmpeg.FFmpeg
+          import com.yausername.youtubedl_android.YoutubeDL
+          import com.yausername.youtubedl_android.YoutubeDLRequest
           import io.flutter.embedding.android.FlutterActivity
           import io.flutter.embedding.engine.FlutterEngine
           import io.flutter.plugin.common.MethodChannel
@@ -124,6 +249,7 @@ jobs:
           import java.io.FileDescriptor
           import java.io.FileInputStream
           import java.nio.ByteBuffer
+          import kotlin.math.abs
 
           class MainActivity : FlutterActivity() {
               companion object {
@@ -131,10 +257,14 @@ jobs:
               }
 
               private var pendingShared: String? = null
+              private var pendingAuto: String? = null
+              private var waitingClip = false
+              private val mainHandler = Handler(Looper.getMainLooper())
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
                   pendingShared = extractShared(intent)
+                  if (intent?.getBooleanExtra("auto_copied", false) == true) waitingClip = true
                   if (Build.VERSION.SDK_INT >= 33 &&
                       checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
                   ) {
@@ -156,6 +286,46 @@ jobs:
                   if (t != null) {
                       if (channelRef != null) channelRef?.invokeMethod("onSharedText", t) else pendingShared = t
                   }
+                  if (intent.getBooleanExtra("auto_copied", false)) waitingClip = true
+              }
+
+              // قراءة الحافظة تتطلب أن تكون النافذة في الواجهة (قيد أندرويد)
+              override fun onWindowFocusChanged(hasFocus: Boolean) {
+                  super.onWindowFocusChanged(hasFocus)
+                  if (hasFocus && waitingClip) {
+                      waitingClip = false
+                      intent?.removeExtra("auto_copied")
+                      mainHandler.postDelayed({ captureClipboard() }, 150)
+                  }
+              }
+
+              private fun captureClipboard() {
+                  val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                  val clip = cm.primaryClip
+                  val text = if (clip != null && clip.itemCount > 0) clip.getItemAt(0).coerceToText(this).toString() else ""
+                  val ok = text.contains("youtu.be") || text.contains("youtube.com")
+                  if (!ok) {
+                      Haptics.failure(this)
+                      moveTaskToBack(true)
+                      return
+                  }
+                  DownloadForegroundService.show(applicationContext, "جاري التحضير...", -1)
+                  pendingAuto = text
+                  // الريلز (Shorts): نعود فوراً ليوتيوب. الطويل: يبقى التطبيق ليسألك عن الدقة.
+                  if (text.contains("/shorts/")) moveTaskToBack(true)
+                  channelRef?.invokeMethod("onAutoLink", text, object : MethodChannel.Result {
+                      override fun success(result: Any?) { pendingAuto = null }
+                      override fun error(errorCode: String, errorMessage: String?, errorDetails: Any?) {}
+                      override fun notImplemented() {}
+                  })
+              }
+
+              private fun isServiceEnabled(): Boolean {
+                  val expected = ComponentName(this, AutoYtGrabberService::class.java)
+                  val enabled = Settings.Secure.getString(
+                      contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+                  ) ?: return false
+                  return enabled.split(':').any { ComponentName.unflattenFromString(it) == expected }
               }
 
               override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -169,6 +339,41 @@ jobs:
                               pendingShared = null
                               result.success(t)
                           }
+                          "getAutoLink" -> {
+                              val t = pendingAuto
+                              pendingAuto = null
+                              result.success(t)
+                          }
+                          "openAccessibilitySettings" -> {
+                              startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                              result.success(true)
+                          }
+                          "requestOverlayPermission" -> {
+                              if (!Settings.canDrawOverlays(this)) {
+                                  startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                              }
+                              result.success(true)
+                          }
+                          "checkPermissions" -> {
+                              result.success(
+                                  mapOf(
+                                      "accessibility" to isServiceEnabled(),
+                                      "overlay" to Settings.canDrawOverlays(this)
+                                  )
+                              )
+                          }
+                          "updateSensitivity" -> {
+                              val v = call.argument<Double>("value") ?: 11.5
+                              getSharedPreferences("yt_prefs", Context.MODE_PRIVATE).edit().putFloat("sensitivity", v.toFloat()).apply()
+                              result.success(true)
+                          }
+                          "getSensitivity" -> {
+                              result.success(getSharedPreferences("yt_prefs", Context.MODE_PRIVATE).getFloat("sensitivity", 11.5f).toDouble())
+                          }
+                          "moveToBack" -> {
+                              moveTaskToBack(true)
+                              result.success(true)
+                          }
                           "dlUpdate" -> {
                               DownloadForegroundService.show(
                                   applicationContext,
@@ -181,13 +386,48 @@ jobs:
                               DownloadForegroundService.finish(call.argument<String>("text") ?: "")
                               result.success(true)
                           }
+                          "ytdlpInit" -> {
+                              Thread {
+                                  val e = YtDlp.init(applicationContext)
+                                  runOnUiThread { result.success(e) }
+                              }.start()
+                          }
+                          "ytdlpUpdate" -> {
+                              Thread {
+                                  val s = YtDlp.update(applicationContext)
+                                  runOnUiThread { result.success(s) }
+                              }.start()
+                          }
+                          "ytdlpInfo" -> {
+                              val url = call.argument<String>("url") ?: ""
+                              Thread {
+                                  val m = YtDlp.info(applicationContext, url)
+                                  runOnUiThread { result.success(m) }
+                              }.start()
+                          }
+                          "ytdlpDownload" -> {
+                              val url = call.argument<String>("url") ?: ""
+                              val format = call.argument<String>("format") ?: "bv*+ba/b"
+                              val merge = call.argument<String>("merge") ?: ""
+                              val prefix = call.argument<String>("prefix") ?: "yt"
+                              val dir = call.argument<String>("dir") ?: cacheDir.absolutePath
+                              Thread {
+                                  val m = YtDlp.download(applicationContext, url, format, merge, prefix, dir)
+                                  runOnUiThread { result.success(m) }
+                              }.start()
+                          }
+                          "ytdlpCancel" -> {
+                              YtDlp.cancel()
+                              result.success(true)
+                          }
                           "finalizeVideo" -> {
                               val video = call.argument<String>("video") ?: ""
                               val audio = call.argument<String>("audio")
                               val webm = call.argument<Boolean>("webm") ?: false
+                              val ext = call.argument<String>("ext") ?: (if (webm) "webm" else "mp4")
                               val title = call.argument<String>("title") ?: "video"
                               Thread {
-                                  val out = Finalizer.finalizeVideo(applicationContext, video, audio, webm, title)
+                                  val out = Finalizer.finalizeVideo(applicationContext, video, audio, webm, ext, title)
                                   runOnUiThread { result.success(out) }
                               }.start()
                           }
@@ -225,15 +465,154 @@ jobs:
               }
           }
 
-          // حفظ الفيديو في المعرض (Movies/YouTubeSaver) ودمج الصورة مع الصوت بدون إعادة ترميز (سريع جداً)
+          object Haptics {
+              @Suppress("DEPRECATION")
+              fun vibrate(ctx: Context, ms: Long) {
+                  try {
+                      val v = ctx.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                          v.vibrate(VibrationEffect.createOneShot(ms, VibrationEffect.DEFAULT_AMPLITUDE))
+                      } else {
+                          v.vibrate(ms)
+                      }
+                  } catch (_: Exception) {}
+              }
+
+              // اهتزازتان قصيرتان = فشل
+              @Suppress("DEPRECATION")
+              fun failure(ctx: Context) {
+                  try {
+                      val v = ctx.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+                      val pattern = longArrayOf(0, 80, 90, 80)
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                          v.vibrate(VibrationEffect.createWaveform(pattern, -1))
+                      } else {
+                          v.vibrate(pattern, -1)
+                      }
+                  } catch (_: Exception) {}
+              }
+          }
+
+          // ===================== محرك yt-dlp الأصلي (Python + ffmpeg + aria2c داخل التطبيق) =====================
+          object YtDlp {
+              @Volatile private var ready = false
+              private val lock = Any()
+              @Volatile private var currentProcess: String? = null
+              private val ui = Handler(Looper.getMainLooper())
+
+              fun init(ctx: Context): String? {
+                  synchronized(lock) {
+                      if (ready) return null
+                      return try {
+                          YoutubeDL.getInstance().init(ctx)
+                          FFmpeg.getInstance().init(ctx)
+                          try { Aria2c.getInstance().init(ctx) } catch (_: Throwable) {}
+                          ready = true
+                          null
+                      } catch (e: Throwable) {
+                          e.message ?: e.toString()
+                      }
+                  }
+              }
+
+              fun update(ctx: Context): String {
+                  val err = init(ctx)
+                  if (err != null) return "update failed: $err"
+                  return try {
+                      val r = YoutubeDL.getInstance().updateYoutubeDL(ctx)
+                      "updated: $r"
+                  } catch (e: Throwable) {
+                      "update failed: ${e.message ?: e}"
+                  }
+              }
+
+              fun info(ctx: Context, url: String): Map<String, Any?> {
+                  val err = init(ctx)
+                  if (err != null) return mapOf("error" to "init: $err")
+                  return try {
+                      val req = YoutubeDLRequest(url)
+                      req.addOption("-J")
+                      req.addOption("--no-playlist")
+                      req.addOption("--no-warnings")
+                      val resp = YoutubeDL.getInstance().execute(req)
+                      mapOf("json" to resp.out)
+                  } catch (e: Throwable) {
+                      mapOf("error" to (e.message ?: e.toString()).take(400))
+                  }
+              }
+
+              fun cancel() {
+                  val p = currentProcess ?: return
+                  try { YoutubeDL.getInstance().destroyProcessById(p) } catch (_: Throwable) {}
+              }
+
+              private fun run(url: String, format: String, merge: String, prefix: String, dir: String, aria: Boolean): String? {
+                  val req = YoutubeDLRequest(url)
+                  req.addOption("-f", format)
+                  if (merge.isNotEmpty()) req.addOption("--merge-output-format", merge)
+                  req.addOption("-o", "$dir/$prefix.%(ext)s")
+                  req.addOption("--no-playlist")
+                  req.addOption("--no-mtime")
+                  if (aria) {
+                      req.addOption("--downloader", "libaria2c.so")
+                      req.addOption("--external-downloader-args", "aria2c:-x 8 -s 8 -k 1M --summary-interval=1")
+                  } else {
+                      req.addOption("-N", "4")
+                  }
+                  val pid = "yt_" + System.currentTimeMillis()
+                  currentProcess = pid
+                  return try {
+                      YoutubeDL.getInstance().execute(req, pid) { progress, _, line ->
+                          ui.post {
+                              MainActivity.channelRef?.invokeMethod(
+                                  "onYtProgress",
+                                  mapOf("p" to progress.toDouble(), "line" to line)
+                              )
+                          }
+                      }
+                      null
+                  } catch (e: Throwable) {
+                      e.message ?: e.toString()
+                  } finally {
+                      currentProcess = null
+                  }
+              }
+
+              fun download(ctx: Context, url: String, format: String, merge: String, prefix: String, dir: String): Map<String, Any?> {
+                  val err = init(ctx)
+                  if (err != null) return mapOf("error" to "init: $err")
+                  var e = run(url, format, merge, prefix, dir, true)
+                  // إن فشل aria2c نعيد المحاولة بالمحمّل الداخلي
+                  if (e != null && !e.contains("destroy", true) && !e.contains("cancel", true) && !e.contains("interrupt", true)) {
+                      e = run(url, format, merge, prefix, dir, false)
+                  }
+                  val files = File(dir).listFiles { f ->
+                      f.name.startsWith("$prefix.") && f.extension.lowercase() in setOf("mp4", "webm", "mkv", "m4a")
+                  }?.sortedByDescending { it.length() }
+                  val best = files?.firstOrNull()
+                  return if (best != null && best.length() > 0 && e == null) {
+                      mapOf("path" to best.absolutePath)
+                  } else {
+                      mapOf("error" to (e ?: "لم يُنتج ملف").take(400))
+                  }
+              }
+          }
+
+          // ===================== حفظ الفيديو في المعرض ودمج الصورة مع الصوت =====================
           object Finalizer {
-              fun finalizeVideo(ctx: Context, videoPath: String, audioPath: String?, webm: Boolean, title: String): Map<String, Any>? {
+              fun finalizeVideo(ctx: Context, videoPath: String, audioPath: String?, webm: Boolean, ext: String, title: String): Map<String, Any>? {
                   if (Build.VERSION.SDK_INT < 29) return null
                   val safe = title.replace(Regex("[\\\\/:*?\"<>|\\n\\r]"), "_").trim().take(60).ifBlank { "video" }
-                  val name = "${safe}_${System.currentTimeMillis()}." + (if (webm) "webm" else "mp4")
+                  val e = if (audioPath != null) (if (webm) "webm" else "mp4") else ext.lowercase().ifBlank { "mp4" }
+                  val mime = when (e) {
+                      "webm" -> "video/webm"
+                      "mkv" -> "video/x-matroska"
+                      else -> "video/mp4"
+                  }
+                  val name = "${safe}_${System.currentTimeMillis()}.$e"
                   val values = ContentValues().apply {
                       put(MediaStore.Video.Media.DISPLAY_NAME, name)
-                      put(MediaStore.Video.Media.MIME_TYPE, if (webm) "video/webm" else "video/mp4")
+                      put(MediaStore.Video.Media.MIME_TYPE, mime)
                       put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/YouTubeSaver")
                       put(MediaStore.Video.Media.IS_PENDING, 1)
                   }
@@ -253,7 +632,7 @@ jobs:
                       resolver.update(uri, values, null, null)
                       val size = resolver.openFileDescriptor(uri, "r")?.use { it.statSize } ?: 0L
                       mapOf("uri" to uri.toString(), "size" to size, "name" to name)
-                  } catch (e: Exception) {
+                  } catch (ex: Exception) {
                       try { resolver.delete(uri, null, null) } catch (_: Exception) {}
                       null
                   } finally {
@@ -282,7 +661,6 @@ jobs:
                       if (vi < 0 || ai < 0) throw IllegalStateException("no tracks")
                       vEx.selectTrack(vi)
                       aEx.selectTrack(ai)
-
                       muxer = MediaMuxer(
                           fd,
                           if (webm) MediaMuxer.OutputFormat.MUXER_OUTPUT_WEBM else MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4
@@ -290,12 +668,10 @@ jobs:
                       val vt = muxer.addTrack(vEx.getTrackFormat(vi))
                       val at = muxer.addTrack(aEx.getTrackFormat(ai))
                       muxer.start()
-
                       val buf = ByteBuffer.allocate(8 * 1024 * 1024)
                       val info = MediaCodec.BufferInfo()
                       var vDone = false
                       var aDone = false
-                      // نكتب العينات بالتناوب حسب وقتها (Interleave) حتى لا تتراكم في الذاكرة
                       while (!vDone || !aDone) {
                           val vTime = if (vDone) Long.MAX_VALUE else vEx.sampleTime
                           val aTime = if (aDone) Long.MAX_VALUE else aEx.sampleTime
@@ -324,7 +700,168 @@ jobs:
               }
           }
 
-          // إشعار التنزيل: شريط تقدم + زر "إيقاف التنزيل" + إبقاء التطبيق حياً في الخلفية
+          // ===================== خدمة النقر الخلفي (تعمل داخل تطبيق يوتيوب فقط) =====================
+          class AutoYtGrabberService : AccessibilityService(), SensorEventListener {
+              private val targetPackages = setOf("com.google.android.youtube")
+
+              private var sensorManager: SensorManager? = null
+              private var listening = false
+              private var busy = false
+              private var firstTapTime: Long = 0
+              private var lastActionTime: Long = 0
+              private val handler = Handler(Looper.getMainLooper())
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+                  if (isTargetForeground()) startListening()
+              }
+
+              private fun isTargetForeground(): Boolean {
+                  val pkg = rootInActiveWindow?.packageName?.toString() ?: return false
+                  return pkg in targetPackages
+              }
+
+              private fun startListening() {
+                  if (listening) return
+                  val sensor = sensorManager?.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION) ?: return
+                  sensorManager?.registerListener(this, sensor, SensorManager.SENSOR_DELAY_GAME)
+                  listening = true
+              }
+
+              private fun stopListening() {
+                  if (!listening) return
+                  sensorManager?.unregisterListener(this)
+                  listening = false
+                  firstTapTime = 0
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+                  if (event == null || event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
+                  val pkg = event.packageName?.toString() ?: return
+                  when {
+                      pkg in targetPackages -> startListening()
+                      pkg == packageName || pkg == "android" ||
+                          pkg.contains("systemui") || pkg.contains("inputmethod") || pkg.contains("keyboard") -> Unit
+                      else -> stopListening()
+                  }
+              }
+
+              override fun onSensorChanged(event: SensorEvent?) {
+                  if (event == null || busy) return
+                  val sensitivity = getSharedPreferences("yt_prefs", Context.MODE_PRIVATE).getFloat("sensitivity", 11.5f)
+                  val x = abs(event.values[0])
+                  val y = abs(event.values[1])
+                  val z = abs(event.values[2])
+                  if (z > sensitivity && x < 6.0f && y < 6.0f) {
+                      val now = System.currentTimeMillis()
+                      if (now - lastActionTime < 5000) return
+                      if (now - firstTapTime > 500) {
+                          firstTapTime = now
+                      } else {
+                          val diff = now - firstTapTime
+                          if (diff in 120..500) {
+                              firstTapTime = 0
+                              if (!isTargetForeground()) return
+                              lastActionTime = now
+                              executeShareAndCopy()
+                          }
+                      }
+                  }
+              }
+
+              private fun executeShareAndCopy() {
+                  val root = rootInActiveWindow ?: return
+                  busy = true
+                  Haptics.vibrate(this, 120)
+                  val shareWords = listOf("مشاركة", "Share", "share", "Send", "إرسال")
+                  if (!findAndClickNode(root, shareWords)) {
+                      Haptics.failure(this)
+                      busy = false
+                      return
+                  }
+                  waitAndClickCopy(0)
+              }
+
+              private fun waitAndClickCopy(attempt: Int) {
+                  val delayMs = if (attempt == 0) 900L else 400L
+                  handler.postDelayed({
+                      val currentRoot = rootInActiveWindow
+                      val copyWords = listOf("نسخ الرابط", "نسخ", "Copy link", "Copy URL", "copy")
+                      val clicked = currentRoot != null && findAndClickNode(currentRoot, copyWords)
+                      when {
+                          clicked -> handler.postDelayed({
+                              val launch = Intent(this, MainActivity::class.java).apply {
+                                  addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+                                  putExtra("auto_copied", true)
+                              }
+                              startActivity(launch)
+                              busy = false
+                          }, 450)
+                          attempt < 5 -> waitAndClickCopy(attempt + 1)
+                          else -> {
+                              Haptics.failure(this)
+                              busy = false
+                          }
+                      }
+                  }, delayMs)
+              }
+
+              // نضغط فقط العناصر الظاهرة فعلاً على الشاشة (يوتيوب يجهّز فيديوهات مجاورة في الخلفية)
+              private fun isOnScreen(node: AccessibilityNodeInfo): Boolean {
+                  if (!node.isVisibleToUser) return false
+                  val r = Rect()
+                  node.getBoundsInScreen(r)
+                  if (r.width() <= 0 || r.height() <= 0) return false
+                  val m = resources.displayMetrics
+                  return r.centerX() in 0..m.widthPixels && r.centerY() in 0..m.heightPixels
+              }
+
+              private fun findAndClickNode(node: AccessibilityNodeInfo, keywords: List<String>): Boolean {
+                  if (isOnScreen(node)) {
+                      val text = node.text?.toString() ?: ""
+                      val desc = node.contentDescription?.toString() ?: ""
+                      val viewId = node.viewIdResourceName ?: ""
+                      for (word in keywords) {
+                          if (text.contains(word, ignoreCase = true) ||
+                              desc.contains(word, ignoreCase = true) ||
+                              viewId.contains(word, ignoreCase = true)
+                          ) {
+                              if (clickClickableParent(node)) return true
+                          }
+                      }
+                  }
+                  for (i in 0 until node.childCount) {
+                      val child = node.getChild(i) ?: continue
+                      if (findAndClickNode(child, keywords)) return true
+                  }
+                  return false
+              }
+
+              private fun clickClickableParent(node: AccessibilityNodeInfo?): Boolean {
+                  var current = node
+                  while (current != null) {
+                      if (current.isClickable) return current.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                      current = current.parent
+                  }
+                  return false
+              }
+
+              override fun onUnbind(intent: Intent?): Boolean {
+                  stopListening()
+                  return super.onUnbind(intent)
+              }
+
+              override fun onDestroy() {
+                  stopListening()
+                  super.onDestroy()
+              }
+
+              override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+              override fun onInterrupt() {}
+          }
+
+          // ===================== إشعار التنزيل: شريط تقدم + زر "إيقاف التنزيل" =====================
           class DownloadForegroundService : Service() {
 
               companion object {
@@ -544,9 +1081,11 @@ jobs:
             final int w, h, fps, bitrate;
             int size;
             final bool hasVideo, hasAudio;
+            final String formatId;
             YtStream({
               required this.url,
               required this.mime,
+              this.formatId = '',
               this.codec = '',
               this.w = 0,
               this.h = 0,
@@ -1150,7 +1689,7 @@ jobs:
             State<Home> createState() => _HomeState();
           }
 
-          class _HomeState extends State<Home> {
+          class _HomeState extends State<Home> with WidgetsBindingObserver {
             static const MethodChannel _ch = MethodChannel('yt_saver/channel');
             final Dio _dio = Dio(BaseOptions(
               connectTimeout: const Duration(seconds: 12),
@@ -1169,12 +1708,23 @@ jobs:
             int _tab = 0;
             bool _busy = false;
             bool _cancelled = false;
-            String _status = "الصق رابط فيديو يوتيوب، أو شاركه إلى هذا التطبيق من تطبيق يوتيوب";
+            String _status = "الصق رابط فيديو يوتيوب، أو انقر مرتين خلف الهاتف أثناء مشاهدة فيديو في تطبيق يوتيوب";
             double _progress = 0;
             String _speed = '';
             List<HistoryItem> _history = [];
             final List<String> _queue = [];
+            final Set<String> _autoUrls = {};
+            final Map<String, DateTime> _recent = {};
             String _lastNote = '';
+            String _lastEngineError = '';
+
+            // الصلاحيات والمحرك
+            bool _accOk = false;
+            bool _overlayOk = false;
+            double _sens = 11.5;
+            String _engineStatus = 'جاري تجهيز محرك yt-dlp...';
+            bool _engineBusy = false;
+            bool _ytdlpActive = false;
 
             int _doneBytes = 0;
             int _totalBytes = 0;
@@ -1185,14 +1735,30 @@ jobs:
             @override
             void initState() {
               super.initState();
+              WidgetsBinding.instance.addObserver(this);
               _ch.setMethodCallHandler((call) async {
-                if (call.method == 'onSharedText') {
-                  _enqueue('${call.arguments}');
-                } else if (call.method == 'onCancelRequested') {
-                  _cancelRequested();
+                switch (call.method) {
+                  case 'onSharedText':
+                    _enqueue('${call.arguments}');
+                    break;
+                  case 'onAutoLink':
+                    _enqueue('${call.arguments}', auto: true);
+                    break;
+                  case 'onCancelRequested':
+                    _cancelRequested();
+                    break;
+                  case 'onYtProgress':
+                    final m = call.arguments;
+                    if (m is Map) _onYtProgress((m['p'] as num).toDouble(), '${m['line']}');
+                    break;
                 }
               });
               _init();
+            }
+
+            @override
+            void didChangeAppLifecycleState(AppLifecycleState state) {
+              if (state == AppLifecycleState.resumed) _checkPerms();
             }
 
             Future<void> _init() async {
@@ -1208,14 +1774,63 @@ jobs:
                 } catch (_) {}
               }
               if (mounted) setState(() => _history = list);
+              await _checkPerms();
+              try {
+                final s = await _ch.invokeMethod<double>('getSensitivity');
+                if (s != null && mounted) setState(() => _sens = s);
+              } catch (_) {}
               try {
                 final shared = await _ch.invokeMethod<String>('getSharedText');
                 if (shared != null && shared.isNotEmpty) _enqueue(shared);
+                final auto = await _ch.invokeMethod<String>('getAutoLink');
+                if (auto != null && auto.isNotEmpty) _enqueue(auto, auto: true);
               } catch (_) {}
+              // تجهيز محرك yt-dlp وتحديثه (مرة كل 12 ساعة) في الخلفية
+              unawaited(_prepareEngine(prefs));
+            }
+
+            Future<void> _checkPerms() async {
+              try {
+                final r = await _ch.invokeMethod<Map>('checkPermissions');
+                if (r != null && mounted) {
+                  setState(() {
+                    _accOk = r['accessibility'] == true;
+                    _overlayOk = r['overlay'] == true;
+                  });
+                }
+              } catch (_) {}
+            }
+
+            Future<void> _prepareEngine(SharedPreferences prefs, {bool force = false}) async {
+              if (_engineBusy) return;
+              _engineBusy = true;
+              if (mounted) setState(() => _engineStatus = 'جاري تجهيز محرك yt-dlp...');
+              try {
+                final err = await _ch.invokeMethod<String>('ytdlpInit');
+                if (err != null) {
+                  if (mounted) setState(() => _engineStatus = 'تعذر تشغيل محرك yt-dlp: $err');
+                  return;
+                }
+                final last = prefs.getInt('ytdlp_updated') ?? 0;
+                final now = DateTime.now().millisecondsSinceEpoch;
+                if (force || now - last > 12 * 3600 * 1000) {
+                  if (mounted) setState(() => _engineStatus = 'جاري تحديث محرك yt-dlp إلى آخر إصدار...');
+                  final res = await _ch.invokeMethod<String>('ytdlpUpdate') ?? '';
+                  if (!res.startsWith('update failed')) await prefs.setInt('ytdlp_updated', now);
+                  if (mounted) setState(() => _engineStatus = res.startsWith('update failed') ? 'المحرك جاهز (تعذر التحديث، تأكد من الإنترنت)' : 'المحرك جاهز ومحدَّث ✓');
+                } else {
+                  if (mounted) setState(() => _engineStatus = 'المحرك جاهز ✓');
+                }
+              } catch (e) {
+                if (mounted) setState(() => _engineStatus = 'تعذر تجهيز المحرك: $e');
+              } finally {
+                _engineBusy = false;
+              }
             }
 
             @override
             void dispose() {
+              WidgetsBinding.instance.removeObserver(this);
               _urlCtl.dispose();
               _serverCtl.dispose();
               super.dispose();
@@ -1242,6 +1857,7 @@ jobs:
             void _cancelRequested() {
               _cancelled = true;
               _queue.clear();
+              _ch.invokeMethod('ytdlpCancel').catchError((_) {});
               _say("جاري إيقاف التنزيل...", ntf: false);
             }
 
@@ -1254,14 +1870,28 @@ jobs:
               return r?.group(1);
             }
 
-            void _enqueue(String raw) {
+            void _enqueue(String raw, {bool auto = false}) {
               final id = _videoId(raw);
               if (id == null) {
                 _say("الرابط ليس رابط فيديو يوتيوب صالحاً.", ntf: false);
+                if (auto && !_busy) _ch.invokeMethod('dlStop', {'text': ''}).catchError((_) {});
                 return;
               }
+              if (auto) {
+                // منع تحميل نفس الفيديو مرتين (رابط قديم عالق في الحافظة)
+                final last = _recent[id];
+                if (last != null && DateTime.now().difference(last).inMinutes < 10) {
+                  _say("هذا نفس الفيديو الذي حُمّل قبل قليل (لم يُنسخ رابط جديد). انقر مرتين على الفيديو التالي.",
+                      ntf: false);
+                  if (!_busy) _ch.invokeMethod('dlStop', {'text': ''}).catchError((_) {});
+                  return;
+                }
+                _recent[id] = DateTime.now();
+              }
               final m = RegExp(r'https?://[^\s"<>]+').firstMatch(raw);
-              _queue.add(m?.group(0) ?? raw.trim());
+              final url = m?.group(0) ?? raw.trim();
+              _queue.add(url);
+              if (auto) _autoUrls.add(url);
               if (_busy) {
                 _say("أُضيف إلى قائمة الانتظار (${_queue.length})", ntf: false);
               }
@@ -1288,9 +1918,66 @@ jobs:
               }
             }
 
+            // ---------------- محرك yt-dlp على الهاتف ----------------
+            Future<YtInfo?> _engYtdlp(String id) async {
+              final r = await _ch.invokeMethod<Map>('ytdlpInfo', {'url': 'https://www.youtube.com/watch?v=$id'});
+              if (r == null) {
+                _lastEngineError = 'لا رد من المحرك';
+                return null;
+              }
+              if (r['json'] == null) {
+                _lastEngineError = '${r['error'] ?? 'خطأ غير معروف'}';
+                return null;
+              }
+              final j = jsonDecode('${r['json']}');
+              if (j is! Map) return null;
+              final streams = <YtStream>[];
+              for (final f in (j['formats'] as List? ?? [])) {
+                if (f is! Map) continue;
+                final proto = '${f['protocol'] ?? ''}';
+                if (proto.contains('m3u8') || proto.contains('mhtml')) continue;
+                final vc = '${f['vcodec'] ?? 'none'}'.toLowerCase();
+                final ac = '${f['acodec'] ?? 'none'}'.toLowerCase();
+                final hasV = vc != 'none';
+                final hasA = ac != 'none';
+                if (!hasV && !hasA) continue;
+                final ext = '${f['ext'] ?? ''}';
+                if (hasV && !(vc.startsWith('avc1') || vc.startsWith('vp9') || vc.startsWith('vp09'))) continue;
+                if (!hasV && !(ac.contains('mp4a') || ac.contains('opus'))) continue;
+                final mime = hasV ? 'video/$ext' : (ext == 'm4a' ? 'audio/mp4' : 'audio/$ext');
+                var size = _int(f['filesize']);
+                if (size <= 0) size = _int(f['filesize_approx']);
+                streams.add(YtStream(
+                  url: '',
+                  mime: mime,
+                  formatId: '${f['format_id']}',
+                  codec: hasV ? vc : ac,
+                  w: _int(f['width']),
+                  h: _int(f['height']),
+                  fps: _int(f['fps']),
+                  bitrate: ((f['tbr'] is num ? (f['tbr'] as num) : 0) * 1000).round(),
+                  size: size,
+                  hasVideo: hasV,
+                  hasAudio: hasA,
+                ));
+              }
+              if (streams.isEmpty) {
+                _lastEngineError = 'لم يُعثر على صيغ صالحة';
+                return null;
+              }
+              final dur = j['duration'];
+              return YtInfo(
+                id: id,
+                title: '${j['title'] ?? 'فيديو يوتيوب'}',
+                durationSec: dur is num ? dur.round() : 0,
+                streams: streams,
+              );
+            }
+
             // ---------------- المعالجة ----------------
             Future<YtInfo?> _resolve(String id, String url, Set<String> failed) async {
               final engines = <MapEntry<String, Future<YtInfo?> Function()>>[
+                MapEntry('yt-dlp', () => _engYtdlp(id)),
                 MapEntry('InnerTube-VR', () => _eng.innerTube(id, 0)),
                 MapEntry('InnerTube-iOS', () => _eng.innerTube(id, 1)),
                 MapEntry('youtube_explode', () => _eng.explode(id)),
@@ -1302,7 +1989,7 @@ jobs:
                 if (failed.contains(e.key)) continue;
                 _say("جاري الفحص عبر محرك: ${e.key}");
                 try {
-                  final info = await e.value().timeout(const Duration(seconds: 25));
+                  final info = await e.value().timeout(Duration(seconds: e.key == 'yt-dlp' ? 120 : 25));
                   if (info == null) {
                     failed.add(e.key);
                     continue;
@@ -1313,9 +2000,9 @@ jobs:
                     failed.add(e.key);
                     continue;
                   }
-                  // فحص سريع أن الرابط يعمل فعلاً قبل عرضه
-                  final best = opts.first;
-                  if (await FastDownloader.probe(best.video.url, info.headers)) return info;
+                  if (e.key == 'yt-dlp') return info;
+                  // بقية المحركات: فحص سريع أن الرابط يعمل قبل عرضه
+                  if (await FastDownloader.probe(opts.first.video.url, info.headers)) return info;
                   failed.add(e.key);
                 } catch (_) {
                   failed.add(e.key);
@@ -1337,8 +2024,7 @@ jobs:
               if (base.isEmpty) return null;
               var title = 'فيديو يوتيوب';
               try {
-                final r = await _dio.get(
-                    'https://www.youtube.com/oembed?url=${Uri.encodeComponent(url)}&format=json');
+                final r = await _dio.get('https://www.youtube.com/oembed?url=${Uri.encodeComponent(url)}&format=json');
                 final j = r.data is String ? jsonDecode(r.data) : r.data;
                 if (j is Map && j['title'] != null) title = '${j['title']}';
               } catch (_) {}
@@ -1368,22 +2054,34 @@ jobs:
 
             Future<void> _processLink(String url) async {
               final id = _videoId(url)!;
+              final isAuto = _autoUrls.remove(url);
               final failed = <String>{};
               int? wantedHeight;
               _lastNote = '';
+              _lastEngineError = '';
 
-              for (int attempt = 0; attempt < 4 && !_cancelled; attempt++) {
+              void moveBackIfAuto() {
+                if (isAuto) _ch.invokeMethod('moveToBack').catchError((_) {});
+              }
+
+              for (int attempt = 0; attempt < 6 && !_cancelled; attempt++) {
                 _say("جاري فحص الفيديو...");
                 final info = await _resolve(id, url, failed);
-                if (_cancelled) return;
+                if (_cancelled) {
+                  _recent.remove(id);
+                  return;
+                }
                 if (info == null) {
+                  _recent.remove(id);
                   _lastNote = "تعذر التحميل: لا يوجد محرك يعمل";
-                  _say("تعذر الوصول للفيديو من كل المحركات. جرّب لاحقاً أو أضف خادمك الخاص (yt-dlp) في الإعدادات بالأسفل.",
+                  _say(
+                      "تعذر الوصول للفيديو من كل المحركات.\nسبب yt-dlp: ${_lastEngineError.isEmpty ? 'غير معروف' : _lastEngineError}\n\nجرّب زر «تحديث المحرك» بالأسفل ثم أعد المحاولة.",
                       ntf: false);
+                  moveBackIfAuto();
                   return;
                 }
                 final options = YtEngines.buildOptions(info);
-                QualityOption? opt;
+                QualityOption opt;
                 if (wantedHeight == null) {
                   final isShort = url.contains('/shorts/') || (info.durationSec > 0 && info.durationSec <= 90);
                   if (isShort) {
@@ -1391,22 +2089,31 @@ jobs:
                   } else {
                     _ntf("بانتظار تأكيدك...", -1, force: true);
                     _say("بانتظار اختيار الجودة...", ntf: false);
-                    opt = await _askUser(info, options, url);
-                    if (opt == null) {
+                    final chosen = await _askUser(info, options, url);
+                    if (chosen == null) {
+                      _recent.remove(id);
                       _lastNote = "تم إلغاء التنزيل";
                       _say("تم إلغاء التنزيل.", ntf: false);
+                      moveBackIfAuto();
                       return;
                     }
+                    opt = chosen;
+                    moveBackIfAuto();
                   }
                   wantedHeight = opt.height;
                 } else {
                   opt = _closest(options, wantedHeight);
                 }
                 final ok = await _downloadAndSave(info, opt, url);
-                if (ok || _cancelled) return;
+                if (ok) return;
+                if (_cancelled) {
+                  _recent.remove(id);
+                  return;
+                }
                 failed.add(info.engine);
               }
               if (!_cancelled) {
+                _recent.remove(id);
                 _lastNote = "تعذر التحميل";
                 _say("فشل التنزيل من جميع المحركات.", ntf: false);
               }
@@ -1533,9 +2240,7 @@ jobs:
                                           child: Row(
                                             children: [
                                               Icon(
-                                                identical(selected, o)
-                                                    ? Icons.radio_button_checked
-                                                    : Icons.radio_button_off,
+                                                identical(selected, o) ? Icons.radio_button_checked : Icons.radio_button_off,
                                                 color: identical(selected, o) ? kRed : Colors.white38,
                                                 size: 20,
                                               ),
@@ -1572,8 +2277,7 @@ jobs:
                                   Expanded(
                                     flex: 2,
                                     child: Container(
-                                      decoration: BoxDecoration(
-                                          gradient: kBrandGradient, borderRadius: BorderRadius.circular(14)),
+                                      decoration: BoxDecoration(gradient: kBrandGradient, borderRadius: BorderRadius.circular(14)),
                                       child: ElevatedButton.icon(
                                         onPressed: () => Navigator.pop(ctx, selected),
                                         style: ElevatedButton.styleFrom(
@@ -1622,7 +2326,34 @@ jobs:
               _ntf("$pct% • ${mbps.toStringAsFixed(1)} MB/s", _totalBytes > 0 ? pct : -1);
             }
 
+            // تقدّم محرك yt-dlp (يصل من الجانب الأصلي)
+            void _onYtProgress(double p, String line) {
+              if (!_ytdlpActive || p < 0) return;
+              final now = DateTime.now();
+              if (now.difference(_lastUi).inMilliseconds < 300) return;
+              _lastUi = now;
+              var speed = '';
+              final m1 = RegExp(r'at\s+([\d.]+\s*[KMG]?i?B/s)').firstMatch(line);
+              final m2 = RegExp(r'DL:([\d.]+\s*[KMG]?i?B)').firstMatch(line);
+              if (m1 != null) {
+                speed = m1.group(1)!;
+              } else if (m2 != null) {
+                speed = '${m2.group(1)}/s';
+              }
+              final pct = p.floor().clamp(0, 100);
+              if (mounted) {
+                setState(() {
+                  _progress = (p / 100).clamp(0.0, 1.0).toDouble();
+                  if (speed.isNotEmpty) _speed = speed;
+                  _status = "جاري التنزيل... $pct%";
+                });
+              }
+              _ntf(speed.isEmpty ? "$pct%" : "$pct% • $speed", pct);
+            }
+
             Future<bool> _downloadAndSave(YtInfo info, QualityOption opt, String url) async {
+              if (info.engine == 'yt-dlp') return _downloadViaYtdlp(info, opt);
+
               final tmp = await getTemporaryDirectory();
               final stamp = DateTime.now().millisecondsSinceEpoch;
               final vPath = '${tmp.path}/yt_$stamp.v';
@@ -1649,12 +2380,13 @@ jobs:
                   headers = const {};
                 }
 
-                final vSize = opt.server ? await FastDownloader.sizeOf(videoUrl, headers) : (opt.video.size > 0 ? opt.video.size : await FastDownloader.sizeOf(videoUrl, headers));
+                final vSize = (!opt.server && opt.video.size > 0)
+                    ? opt.video.size
+                    : await FastDownloader.sizeOf(videoUrl, headers);
                 final aSize = opt.audio == null
                     ? 0
                     : (opt.audio!.size > 0 ? opt.audio!.size : await FastDownloader.sizeOf(opt.audio!.url, headers));
-                _totalBytes = (vSize > 0 ? vSize : 0) + aSize;
-                if (vSize <= 0) _totalBytes = 0;
+                _totalBytes = vSize > 0 ? vSize + aSize : 0;
                 _doneBytes = 0;
                 _sw
                   ..reset()
@@ -1666,57 +2398,126 @@ jobs:
                 if (opt.audio != null) tasks.add(dl.download(opt.audio!.url, aPath, aSize, headers));
                 final res = await Future.wait(tasks);
                 _sw.stop();
-                if (_cancelled) {
-                  await cleanup();
-                  return false;
-                }
-                if (!res.every((x) => x)) {
+                if (_cancelled || !res.every((x) => x)) {
                   await cleanup();
                   return false;
                 }
 
-                _say("جاري الدمج والحفظ في المعرض...");
-                _ntf("جاري الدمج والحفظ...", -1, force: true);
-                final out = await _ch.invokeMethod<Map>('finalizeVideo', {
-                  'video': vPath,
-                  'audio': opt.audio != null ? aPath : null,
-                  'webm': opt.webm,
-                  'title': info.title,
-                });
-                if (out == null) {
-                  await cleanup();
-                  _say("فشل الدمج/الحفظ (يتطلب أندرويد 10 أو أحدث).", ntf: false);
-                  return false;
-                }
-                final size = _int(out['size']);
-                final now = DateTime.now();
-                final date =
-                    "${now.year}/${now.month.toString().padLeft(2, '0')}/${now.day.toString().padLeft(2, '0')} - ${now.hour}:${now.minute.toString().padLeft(2, '0')}";
-                _history.insert(
-                  0,
-                  HistoryItem(
-                    id: '$stamp',
-                    videoId: info.id,
-                    title: info.title,
-                    uri: '${out['uri']}',
-                    quality: opt.label,
-                    size: fmtSize(size),
-                    date: date,
-                  ),
+                return await _finalize(
+                  info: info,
+                  opt: opt,
+                  videoPath: vPath,
+                  audioPath: opt.audio != null ? aPath : null,
+                  ext: opt.webm ? 'webm' : 'mp4',
+                  cleanup: cleanup,
                 );
-                await _saveHistory();
-                _lastNote = "تم تنزيل «${info.title}» (${opt.height}p) ✓";
-                if (mounted) {
-                  setState(() {
-                    _progress = 1;
-                    _status = "تم التنزيل (${opt.label} • ${fmtSize(size)}) وحُفظ في المعرض ✓";
-                  });
-                }
-                return true;
               } catch (_) {
                 await cleanup();
                 return false;
               }
+            }
+
+            Future<bool> _downloadViaYtdlp(YtInfo info, QualityOption opt) async {
+              final tmp = await getTemporaryDirectory();
+              final stamp = DateTime.now().millisecondsSinceEpoch;
+              final prefix = 'yt_$stamp';
+              final fmt = opt.audio != null ? '${opt.video.formatId}+${opt.audio!.formatId}' : opt.video.formatId;
+              final merge = opt.audio != null ? (opt.webm ? 'webm' : 'mp4') : '';
+              _ytdlpActive = true;
+              _doneBytes = 0;
+              if (mounted) {
+                setState(() {
+                  _progress = 0;
+                  _speed = '';
+                });
+              }
+              _say("جاري التنزيل بمحرك yt-dlp (${opt.height}p)...");
+              try {
+                final r = await _ch.invokeMethod<Map>('ytdlpDownload', {
+                  'url': 'https://www.youtube.com/watch?v=${info.id}',
+                  'format': fmt,
+                  'merge': merge,
+                  'prefix': prefix,
+                  'dir': tmp.path,
+                });
+                if (_cancelled) {
+                  return false;
+                }
+                if (r == null || r['path'] == null) {
+                  _lastEngineError = '${r?['error'] ?? 'فشل التنزيل'}';
+                  _say("فشل محرك yt-dlp: $_lastEngineError", ntf: false);
+                  return false;
+                }
+                final path = '${r['path']}';
+                final ext = path.split('.').last.toLowerCase();
+                return await _finalize(
+                  info: info,
+                  opt: opt,
+                  videoPath: path,
+                  audioPath: null,
+                  ext: ext,
+                  cleanup: () async {
+                    try {
+                      final f = File(path);
+                      if (await f.exists()) await f.delete();
+                    } catch (_) {}
+                  },
+                );
+              } catch (e) {
+                _lastEngineError = '$e';
+                return false;
+              } finally {
+                _ytdlpActive = false;
+              }
+            }
+
+            Future<bool> _finalize({
+              required YtInfo info,
+              required QualityOption opt,
+              required String videoPath,
+              required String? audioPath,
+              required String ext,
+              required Future<void> Function() cleanup,
+            }) async {
+              _say("جاري الحفظ في المعرض...");
+              _ntf("جاري الحفظ...", -1, force: true);
+              final out = await _ch.invokeMethod<Map>('finalizeVideo', {
+                'video': videoPath,
+                'audio': audioPath,
+                'webm': opt.webm,
+                'ext': ext,
+                'title': info.title,
+              });
+              if (out == null) {
+                await cleanup();
+                _say("فشل الحفظ (يتطلب أندرويد 10 أو أحدث).", ntf: false);
+                return false;
+              }
+              final size = _int(out['size']);
+              final now = DateTime.now();
+              final date =
+                  "${now.year}/${now.month.toString().padLeft(2, '0')}/${now.day.toString().padLeft(2, '0')} - ${now.hour}:${now.minute.toString().padLeft(2, '0')}";
+              _history.insert(
+                0,
+                HistoryItem(
+                  id: '${DateTime.now().millisecondsSinceEpoch}',
+                  videoId: info.id,
+                  title: info.title,
+                  uri: '${out['uri']}',
+                  quality: opt.label,
+                  size: fmtSize(size),
+                  date: date,
+                ),
+              );
+              await _saveHistory();
+              _lastNote = "تم تنزيل «${info.title}» (${opt.height}p) ✓";
+              if (mounted) {
+                setState(() {
+                  _progress = 1;
+                  _status = "تم التنزيل (${opt.label} • ${fmtSize(size)}) وحُفظ في المعرض ✓";
+                });
+              }
+              return true;
             }
 
             // ---------------- الواجهة ----------------
@@ -1764,31 +2565,76 @@ jobs:
               );
             }
 
-            Widget _header() => Padding(
-                  padding: const EdgeInsets.fromLTRB(20, 14, 12, 6),
-                  child: Row(
-                    children: [
-                      Container(
-                        width: 42,
-                        height: 42,
-                        decoration: BoxDecoration(gradient: kBrandGradient, borderRadius: BorderRadius.circular(14)),
-                        child: const Icon(Icons.play_arrow_rounded, color: Colors.white, size: 28),
+            Widget _header() {
+              final ready = _accOk && _overlayOk;
+              return Padding(
+                padding: const EdgeInsets.fromLTRB(20, 14, 12, 6),
+                child: Row(
+                  children: [
+                    Container(
+                      width: 42,
+                      height: 42,
+                      decoration: BoxDecoration(gradient: kBrandGradient, borderRadius: BorderRadius.circular(14)),
+                      child: const Icon(Icons.play_arrow_rounded, color: Colors.white, size: 28),
+                    ),
+                    const SizedBox(width: 12),
+                    const Expanded(
+                      child: Text(kAppTitle, style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800)),
+                    ),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                      decoration: BoxDecoration(
+                        color: (ready ? kGreen : kAmber).withOpacity(0.14),
+                        borderRadius: BorderRadius.circular(20),
                       ),
-                      const SizedBox(width: 12),
-                      const Expanded(
-                        child: Text(kAppTitle, style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800)),
+                      child: Row(mainAxisSize: MainAxisSize.min, children: [
+                        Icon(Icons.circle, size: 8, color: ready ? kGreen : kAmber),
+                        const SizedBox(width: 6),
+                        Text(ready ? "نشط" : "غير مفعّل",
+                            style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: ready ? kGreen : kAmber)),
+                      ]),
+                    ),
+                    IconButton(
+                      onPressed: () => setState(() => _tab = _tab == 0 ? 1 : 0),
+                      icon: Badge(
+                        isLabelVisible: _tab == 0 && _history.isNotEmpty,
+                        label: Text('${_history.length}'),
+                        child: Icon(_tab == 0 ? Icons.video_library_rounded : Icons.home_rounded, color: kRed),
                       ),
-                      IconButton(
-                        onPressed: () => setState(() => _tab = _tab == 0 ? 1 : 0),
-                        icon: Badge(
-                          isLabelVisible: _tab == 0 && _history.isNotEmpty,
-                          label: Text('${_history.length}'),
-                          child: Icon(_tab == 0 ? Icons.video_library_rounded : Icons.home_rounded, color: kRed),
-                        ),
-                      ),
-                    ],
-                  ),
-                );
+                    ),
+                  ],
+                ),
+              );
+            }
+
+            Widget _step(int n, String title, String sub, bool done, VoidCallback onTap) {
+              return InkWell(
+                onTap: done ? null : onTap,
+                borderRadius: BorderRadius.circular(16),
+                child: Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(color: kBg.withOpacity(0.6), borderRadius: BorderRadius.circular(16)),
+                  child: Row(children: [
+                    CircleAvatar(
+                      radius: 17,
+                      backgroundColor: done ? kGreen : kAmber.withOpacity(0.2),
+                      child: done
+                          ? const Icon(Icons.check_rounded, color: Colors.black, size: 20)
+                          : Text('$n', style: const TextStyle(color: kAmber, fontWeight: FontWeight.w800)),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        Text(title, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+                        const SizedBox(height: 2),
+                        Text(sub, style: const TextStyle(color: Colors.white54, fontSize: 12)),
+                      ]),
+                    ),
+                    if (!done) const Icon(Icons.chevron_left_rounded, color: Colors.white38),
+                  ]),
+                ),
+              );
+            }
 
             Widget _homeTab() {
               return ListView(
@@ -1807,13 +2653,13 @@ jobs:
                     ),
                     child: const Column(
                       children: [
-                        Icon(Icons.bolt_rounded, size: 46, color: Colors.white),
+                        Icon(Icons.touch_app_rounded, size: 46, color: Colors.white),
                         SizedBox(height: 10),
-                        Text("تنزيل يوتيوب بأقصى سرعة",
+                        Text("انقر مرتين خلف الهاتف",
                             style: TextStyle(fontSize: 21, fontWeight: FontWeight.w800, color: Colors.white)),
                         SizedBox(height: 6),
                         Text(
-                          "ريلز (Shorts) وفيديوهات طويلة بدقة تصل إلى 4K. اتصالات متوازية، دمج فوري، وعدة محركات احتياطية.",
+                          "أثناء مشاهدة فيديو أو ريلز في تطبيق يوتيوب: يُنسخ الرابط ويُنزَّل تلقائياً. الفيديوهات الطويلة يسألك أولاً عن الدقة (حتى 4K).",
                           textAlign: TextAlign.center,
                           style: TextStyle(color: Colors.white70, fontSize: 13, height: 1.6),
                         ),
@@ -1821,6 +2667,33 @@ jobs:
                     ),
                   ),
                   const SizedBox(height: 16),
+                  if (!(_accOk && _overlayOk)) ...[
+                    _card(
+                      border: kAmber.withOpacity(0.45),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          const Row(children: [
+                            Icon(Icons.tune_rounded, color: kAmber),
+                            SizedBox(width: 10),
+                            Text("التفعيل لأول مرة فقط", style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16)),
+                          ]),
+                          const SizedBox(height: 14),
+                          _step(1, "السماح بالعمل في الخلفية", "الظهور فوق التطبيقات الأخرى", _overlayOk,
+                              () => _ch.invokeMethod('requestOverlayPermission')),
+                          const SizedBox(height: 10),
+                          _step(2, "تفعيل خدمة النقر الخلفي", "من إعدادات إمكانية الوصول (Accessibility)", _accOk,
+                              () => _ch.invokeMethod('openAccessibilitySettings')),
+                          const SizedBox(height: 12),
+                          const Text(
+                            "إن كان الخيار رمادياً: افتح معلومات التطبيق ← ⋮ ← السماح بالإعدادات المقيّدة، ثم أعد المحاولة.",
+                            style: TextStyle(fontSize: 12, color: Colors.white54, height: 1.6),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                  ],
                   _card(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -1932,6 +2805,91 @@ jobs:
                   ),
                   const SizedBox(height: 16),
                   _card(
+                    child: Column(
+                      children: [
+                        Row(children: [
+                          const Icon(Icons.vibration_rounded, color: kViolet),
+                          const SizedBox(width: 10),
+                          const Expanded(
+                            child: Text("حساسية النقر الخلفي", style: TextStyle(fontWeight: FontWeight.w800, fontSize: 15)),
+                          ),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                            decoration: BoxDecoration(color: kCyan.withOpacity(0.14), borderRadius: BorderRadius.circular(12)),
+                            child: Text(_sens.toStringAsFixed(1),
+                                style: const TextStyle(color: kCyan, fontWeight: FontWeight.w800)),
+                          ),
+                        ]),
+                        SliderTheme(
+                          data: SliderTheme.of(context).copyWith(
+                            activeTrackColor: kCyan,
+                            inactiveTrackColor: Colors.white12,
+                            thumbColor: Colors.white,
+                            overlayColor: kCyan.withOpacity(0.15),
+                          ),
+                          child: Slider(
+                            value: _sens,
+                            min: 7.5,
+                            max: 16.0,
+                            divisions: 17,
+                            onChanged: (v) {
+                              setState(() => _sens = v);
+                              _ch.invokeMethod('updateSensitivity', {'value': v}).catchError((_) {});
+                            },
+                          ),
+                        ),
+                        const Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Text("نقرة خفيفة", style: TextStyle(fontSize: 12, color: Colors.white54)),
+                            Text("نقرة قوية", style: TextStyle(fontSize: 12, color: Colors.white54)),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  _card(
+                    border: kGreen.withOpacity(0.3),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        const Row(children: [
+                          Icon(Icons.memory_rounded, color: kGreen),
+                          SizedBox(width: 10),
+                          Expanded(
+                            child: Text("محرك yt-dlp (يعمل على هاتفك)",
+                                style: TextStyle(fontWeight: FontWeight.w800, fontSize: 15)),
+                          ),
+                        ]),
+                        const SizedBox(height: 8),
+                        Text(_engineStatus, style: const TextStyle(fontSize: 12.5, color: Colors.white70, height: 1.6)),
+                        const SizedBox(height: 10),
+                        OutlinedButton.icon(
+                          onPressed: _engineBusy
+                              ? null
+                              : () async {
+                                  final p = await SharedPreferences.getInstance();
+                                  await _prepareEngine(p, force: true);
+                                },
+                          icon: const Icon(Icons.system_update_alt_rounded),
+                          label: const Text("تحديث المحرك الآن"),
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: kGreen,
+                            side: const BorderSide(color: kGreen),
+                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        const Text(
+                          "يوتيوب يغيّر نظامه كثيراً؛ إن توقف التنزيل فاضغط «تحديث المحرك» ثم أعد المحاولة.",
+                          style: TextStyle(fontSize: 11.5, color: Colors.white38, height: 1.6),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  _card(
                     border: kCyan.withOpacity(0.3),
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -1971,7 +2929,7 @@ jobs:
                   ),
                   const SizedBox(height: 14),
                   const Center(
-                    child: Text("نصيحة: من تطبيق يوتيوب اضغط «مشاركة» ثم اختر هذا التطبيق",
+                    child: Text("يمكنك أيضاً: «مشاركة» من يوتيوب ثم اختيار هذا التطبيق",
                         textAlign: TextAlign.center, style: TextStyle(color: Colors.white38, fontSize: 12)),
                   ),
                 ],
@@ -2073,12 +3031,12 @@ jobs:
         continue-on-error: true
         run: |
           cd yt_build
-          flutter analyze --no-fatal-infos --no-fatal-warnings 2>&1 | grep -E "error|Error" | head -40 || true
+          flutter analyze --no-fatal-infos --no-fatal-warnings 2>&1 | grep -E "error" | head -40 || true
 
-      - name: Build Release APK
+      - name: Build Release APK (arm64)
         run: |
           cd yt_build
-          flutter build apk --release
+          flutter build apk --release --target-platform android-arm64
 
       - name: Upload Ready APK
         uses: actions/upload-artifact@v4
